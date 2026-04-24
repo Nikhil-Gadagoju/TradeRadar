@@ -9,8 +9,26 @@ import os
 import hashlib
 import secrets
 from streamlit_autorefresh import st_autorefresh
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="TradeRadar", page_icon="📡", layout="wide")
+
+TRADING_MODE_CONFIG = {
+    "Day Trading": {
+        "period_options": ["1d", "5d", "1mo", "3mo"],
+        "default_period": "5d",
+        "interval": "1h",
+    },
+    "Long-Term Investing": {
+        "period_options": ["1mo", "3mo", "6mo", "1y", "2y", "5y"],
+        "default_period": "1y",
+        "interval": "1d",
+    },
+}
+
+
+def _mode_settings(trading_mode: str) -> dict:
+    return TRADING_MODE_CONFIG.get(trading_mode, TRADING_MODE_CONFIG["Long-Term Investing"])
 
 # ══════════════════════════════════════════════════════════════════════════════
 # CONFIG (API keys etc.)
@@ -271,40 +289,36 @@ def _show_user_management():
     else:
         st.info("No other users to delete.")
 
-    # ── External API Keys ─────────────────────────────────────────────────────
+    # ── External Data API Keys ────────────────────────────────────────────────
     st.markdown("---")
-    st.subheader("🔑 Data Source API Keys")
-    st.caption("All sources are optional. More keys = richer signals from more agents.")
-    cfg = load_config()
-
+    st.subheader("🔌 External Data API Keys")
+    st.caption("Optional — enables richer multi-agent analysis. Leave blank to use yfinance-only fallbacks.")
+    ext_cfg = load_config()
     key_fields = [
-        ("finnhub_api_key",    "Finnhub API Key",    "Get free key at finnhub.io",           "News, earnings, analyst ratings"),
-        ("fred_api_key",       "FRED API Key",       "Get free key at fred.stlouisfed.org",   "Macro: interest rates, inflation, GDP"),
-        ("polygon_api_key",    "Polygon.io API Key", "Get free key at polygon.io",            "Intraday data, real-time quotes"),
-        ("reddit_client_id",   "Reddit Client ID",   "Create app at reddit.com/prefs/apps",   "WSB/r/stocks sentiment"),
-        ("reddit_secret",      "Reddit Client Secret","Same Reddit app as above",             "WSB/r/stocks sentiment"),
+        ("finnhub_api_key",  "Finnhub API Key",       "finnhub.io",             "News sentiment & analyst ratings"),
+        ("fred_api_key",     "FRED API Key",           "fred.stlouisfed.org",    "Macro: interest rates, inflation, unemployment"),
+        ("polygon_api_key",  "Polygon.io API Key",     "polygon.io",             "Intraday data & real-time quotes"),
+        ("reddit_client_id", "Reddit Client ID",       "reddit.com/prefs/apps",  "WSB / r/stocks social sentiment"),
+        ("reddit_secret",    "Reddit Client Secret",   "Same Reddit app",        "WSB / r/stocks social sentiment"),
     ]
-    with st.form("external_keys_form"):
+    with st.form("ext_api_keys_form"):
         new_vals = {}
-        for key, label, help_txt, usage in key_fields:
-            col1, col2 = st.columns([3, 1])
-            with col1:
-                new_vals[key] = st.text_input(label, value=cfg.get(key, ""),
-                                              type="password", help=f"{help_txt} · Used for: {usage}")
-            with col2:
-                st.caption(f"**{usage}**")
-        if st.form_submit_button("Save API Keys", type="primary"):
-            for k, v in new_vals.items():
-                if v.strip():
-                    cfg[k] = v.strip()
-            save_config(cfg)
-            st.success("API keys saved.")
-
-    active = [label for key, label, _, _ in key_fields if cfg.get(key)]
-    if active:
-        st.caption(f"Active sources: {', '.join(active)}")
-    else:
-        st.info("No external keys set — TradeRadar will use yfinance only.")
+        for field_key, label, source, desc in key_fields:
+            new_vals[field_key] = st.text_input(
+                label,
+                value=ext_cfg.get(field_key, ""),
+                type="password",
+                placeholder=f"Get from {source}",
+                help=desc,
+            )
+        if st.form_submit_button("Save External Keys", type="primary"):
+            for field_key, val in new_vals.items():
+                if val.strip():
+                    ext_cfg[field_key] = val.strip()
+                elif field_key in ext_cfg:
+                    del ext_cfg[field_key]
+            save_config(ext_cfg)
+            st.success("External API keys saved.")
 
     # ── Claude API key ────────────────────────────────────────────────────────
     st.markdown("---")
@@ -330,6 +344,75 @@ def _show_user_management():
         st.caption(f"Key on file: `{cur_key[:10]}...{cur_key[-4:]}` · AI chat is **enabled**")
     else:
         st.warning("No API key set — AI chat will not be available until an admin adds one.")
+
+    # ── Telegram Bot Settings ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📲 Telegram Alert Bot")
+    st.caption("Alerts are sent to your phone via Telegram when a BUY or SELL signal fires during market hours.")
+    with st.expander("Setup Instructions", expanded=False):
+        st.markdown("""
+1. Open Telegram → search **@BotFather** → send `/newbot` → follow prompts → copy the **Bot Token**
+2. Start a chat with your new bot, then open: `https://api.telegram.org/bot<TOKEN>/getUpdates`
+   and copy the **`chat.id`** number from the response
+3. Paste both below and save
+4. On the Pi, run: `pm2 start bot.py --name tradbot --interpreter python3`
+5. Reboot-persist: `pm2 save && pm2 startup`
+""")
+    tg_cfg = load_config()
+    with st.form("telegram_form"):
+        tg_token   = st.text_input("Bot Token",   value=tg_cfg.get("telegram_token", ""),
+                                   type="password", placeholder="123456789:AABBcc...")
+        tg_chat_id = st.text_input("Your Chat ID", value=tg_cfg.get("telegram_chat_id", ""),
+                                   placeholder="123456789")
+        wl_default = ", ".join(tg_cfg.get("alert_watchlist", [
+            "NVDA","AAPL","MSFT","GOOGL","META","AMD","TSLA","AMZN","JPM","V"
+        ]))
+        wl_input   = st.text_area("Alert Watchlist (comma-separated tickers)",
+                                  value=wl_default, height=80)
+        tg_save = st.form_submit_button("Save Telegram Settings", type="primary")
+        tg_test = st.form_submit_button("💬 Send Test Alert")
+
+        if tg_save or tg_test:
+            tg_cfg["telegram_token"]   = tg_token.strip()
+            tg_cfg["telegram_chat_id"] = tg_chat_id.strip()
+            tg_cfg["alert_watchlist"]  = [t.strip().upper() for t in wl_input.split(",") if t.strip()]
+            save_config(tg_cfg)
+            if tg_save:
+                st.success("Telegram settings saved.")
+            if tg_test and tg_token.strip() and tg_chat_id.strip():
+                try:
+                    import requests as _req
+                    _req.post(
+                        f"https://api.telegram.org/bot{tg_token.strip()}/sendMessage",
+                        json={
+                            "chat_id": tg_chat_id.strip(),
+                            "text": (
+                                "📡 <b>TradeRadar Test Alert</b>\n"
+                                "━━━━━━━━━━━━━━━━━━\n"
+                                "🟢 <b>BUY — NVDA</b> (example)\n"
+                                "💲 Price: $875.20\n"
+                                "📊 RSI 38 (oversold)  •  MACD ▲  •  2.1x vol\n\n"
+                                "🎯 <b>Trade Setup</b>\n"
+                                "  Entry zone:  $871 – $879\n"
+                                "  🎯 Sell T1:  $893  (+2.1%)\n"
+                                "  🎯 Sell T2:  $907  (+3.6%)\n"
+                                "  🛑 Stop loss: $857  (-2.1%)\n"
+                                "  ⚖️  R/R:      1 : 2.0\n\n"
+                                "✅ Bot is connected successfully!"
+                            ),
+                            "parse_mode": "HTML",
+                        },
+                        timeout=10,
+                    )
+                    st.success("Test alert sent! Check your Telegram.")
+                except Exception as _e:
+                    st.error(f"Failed to send test: {_e}")
+
+    if tg_cfg.get("telegram_token") and tg_cfg.get("telegram_chat_id"):
+        wl = tg_cfg.get("alert_watchlist", [])
+        st.caption(f"Bot configured · Watching **{len(wl)} tickers**: {', '.join(wl[:8])}{'…' if len(wl) > 8 else ''}")
+    else:
+        st.info("Configure your Bot Token and Chat ID above, then start bot.py on the Pi.")
 
 
 def _show_change_password():
@@ -521,6 +604,8 @@ def search_ticker(query: str) -> str:
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # Moving averages
+    df["EMA_9"] = df["Close"].ewm(span=9, adjust=False).mean()
+    df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
     df["SMA_20"] = df["Close"].rolling(20).mean()
     df["SMA_50"] = df["Close"].rolling(50).mean()
     df["EMA_12"] = df["Close"].ewm(span=12, adjust=False).mean()
@@ -548,6 +633,7 @@ def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["Vol_MA20"] = df["Volume"].rolling(20).mean()
     df["Vol_Ratio"] = df["Volume"] / df["Vol_MA20"].replace(0, np.nan)
     # 5-day Rate of Change
+    df["ROC_1"] = df["Close"].pct_change(1) * 100
     df["ROC_5"] = df["Close"].pct_change(5) * 100
     # MACD histogram direction (rising = bullish momentum)
     df["MACD_Rising"] = df["MACD_Hist"] > df["MACD_Hist"].shift(1)
@@ -890,382 +976,474 @@ def _sector_momentum_score(ticker: str, info: dict, df: pd.DataFrame):
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MULTI-AGENT ANALYSIS ENGINE
-# Each agent runs independently, returns (score, label, details_dict).
-# Consolidator weighs them and returns a unified verdict.
-# All external agents are optional — gracefully skipped if no API key.
 # ══════════════════════════════════════════════════════════════════════════════
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ── Agent 1: Technical Agent (yfinance) ───────────────────────────────────────
 def _agent_technical(ticker: str, df: pd.DataFrame) -> dict:
     try:
-        if df is None or len(df) < 20:
-            return {"agent": "Technical", "score": 0, "verdict": "NEUTRAL", "details": "Insufficient data"}
-        close = df["Close"]
-        vol   = df["Volume"]
-        sma20 = close.rolling(20).mean().iloc[-1]
-        sma50 = close.rolling(50).mean().iloc[-1] if len(df) >= 50 else sma20
+        df = df.copy()
+        close = df["Close"].squeeze()
+        volume = df["Volume"].squeeze()
+
+        sma20 = float(close.rolling(20).mean().iloc[-1])
+        sma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else sma20
         price = float(close.iloc[-1])
+
+        # RSI
         delta = close.diff()
-        gain  = delta.clip(lower=0).rolling(14).mean().iloc[-1]
-        loss  = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
-        rsi   = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
-        ema12 = close.ewm(span=12).mean().iloc[-1]
-        ema26 = close.ewm(span=26).mean().iloc[-1]
-        macd  = ema12 - ema26
-        vol_avg = vol.rolling(20).mean().iloc[-1]
-        vol_now = float(vol.iloc[-1])
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta.clip(upper=0)).rolling(14).mean()
+        rs = gain / loss.replace(0, float("nan"))
+        rsi = float(100 - 100 / (1 + rs.iloc[-1]))
 
-        score = 0
-        notes = []
-        if price > float(sma20):   score += 1; notes.append("Above SMA20 ✓")
-        else:                       score -= 1; notes.append("Below SMA20 ✗")
-        if float(sma20) > float(sma50): score += 1; notes.append("SMA20 > SMA50 ✓")
-        else:                            score -= 1; notes.append("SMA20 < SMA50 ✗")
-        if rsi < 35:   score += 2; notes.append(f"RSI oversold {rsi:.0f} ✓")
-        elif rsi > 70: score -= 2; notes.append(f"RSI overbought {rsi:.0f} ✗")
-        else:          notes.append(f"RSI neutral {rsi:.0f}")
-        if macd > 0:   score += 1; notes.append("MACD bullish ✓")
-        else:          score -= 1; notes.append("MACD bearish ✗")
-        if vol_now > vol_avg * 1.5: score += 1; notes.append("Volume surge ✓")
+        # MACD
+        ema12 = close.ewm(span=12).mean()
+        ema26 = close.ewm(span=26).mean()
+        macd_hist = float((ema12 - ema26 - (ema12 - ema26).ewm(span=9).mean()).iloc[-1])
 
-        verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
-        return {"agent": "Technical", "score": score, "verdict": verdict,
-                "details": " · ".join(notes), "weight": 1.5}
+        # Volume surge
+        avg_vol = float(volume.rolling(20).mean().iloc[-1])
+        cur_vol = float(volume.iloc[-1])
+        vol_surge = cur_vol > avg_vol * 1.5
+
+        score = 0.0
+        details = []
+
+        if price > sma20:
+            score += 1; details.append(f"Price ${price:.2f} above SMA20 ${sma20:.2f}")
+        else:
+            score -= 1; details.append(f"Price ${price:.2f} below SMA20 ${sma20:.2f}")
+
+        if sma20 > sma50:
+            score += 1; details.append("Golden cross: SMA20 > SMA50")
+        else:
+            score -= 1; details.append("Death cross: SMA20 < SMA50")
+
+        if rsi < 30:
+            score += 1.5; details.append(f"RSI {rsi:.1f} — oversold (bullish reversal)")
+        elif rsi > 70:
+            score -= 1.5; details.append(f"RSI {rsi:.1f} — overbought (bearish)")
+        elif 40 <= rsi <= 60:
+            score += 0.5; details.append(f"RSI {rsi:.1f} — healthy momentum")
+        else:
+            details.append(f"RSI {rsi:.1f} — neutral")
+
+        if macd_hist > 0:
+            score += 1; details.append(f"MACD histogram positive ({macd_hist:+.4f})")
+        else:
+            score -= 1; details.append(f"MACD histogram negative ({macd_hist:+.4f})")
+
+        if vol_surge:
+            score += 0.5; details.append(f"Volume surge: {cur_vol/avg_vol:.1f}x average")
+
+        return {"name": "Technical Analysis", "score": score, "weight": 1.5,
+                "details": details, "icon": "📈"}
     except Exception as e:
-        return {"agent": "Technical", "score": 0, "verdict": "NEUTRAL", "details": str(e), "weight": 1.5}
+        return {"name": "Technical Analysis", "score": 0, "weight": 1.5,
+                "details": [f"Error: {e}"], "icon": "📈"}
 
 
-# ── Agent 2: Fundamentals Agent (yfinance + SEC EDGAR) ────────────────────────
 def _agent_fundamentals(ticker: str, info: dict) -> dict:
     try:
-        score = 0
-        notes = []
-        if not info:
-            return {"agent": "Fundamentals", "score": 0, "verdict": "NEUTRAL",
-                    "details": "No fundamental data", "weight": 1.2}
+        score = 0.0
+        details = []
 
-        pe  = info.get("trailingPE") or info.get("forwardPE")
+        pe = info.get("trailingPE")
+        if pe:
+            if pe < 15:
+                score += 1.5; details.append(f"P/E {pe:.1f} — undervalued")
+            elif pe < 25:
+                score += 0.5; details.append(f"P/E {pe:.1f} — fair value")
+            elif pe > 40:
+                score -= 1.5; details.append(f"P/E {pe:.1f} — expensive")
+            else:
+                score -= 0.5; details.append(f"P/E {pe:.1f} — slightly elevated")
+
         peg = info.get("pegRatio")
-        roe = (info.get("returnOnEquity") or 0) * 100
-        de  = (info.get("debtToEquity") or 0)
-        eg  = (info.get("earningsGrowth") or info.get("revenueGrowth") or 0) * 100
-        fcf = info.get("freeCashflow") or 0
-        mc  = info.get("marketCap") or 1
+        if peg:
+            if peg < 1:
+                score += 1; details.append(f"PEG {peg:.2f} — growth at discount")
+            elif peg > 2:
+                score -= 1; details.append(f"PEG {peg:.2f} — overvalued vs growth")
 
-        if pe and pe < 15:   score += 1; notes.append(f"P/E low {pe:.1f} ✓")
-        elif pe and pe > 40: score -= 1; notes.append(f"P/E high {pe:.1f} ✗")
-        if peg and peg < 1:  score += 2; notes.append(f"PEG undervalued {peg:.2f} ✓")
-        elif peg and peg > 2.5: score -= 1; notes.append(f"PEG stretched {peg:.2f} ✗")
-        if roe > 20:  score += 1; notes.append(f"ROE strong {roe:.1f}% ✓")
-        if de < 50:   score += 1; notes.append(f"Low debt ✓")
-        elif de > 200: score -= 1; notes.append(f"High debt {de:.0f}% ✗")
-        if eg > 15:   score += 1; notes.append(f"Growth {eg:.1f}% ✓")
-        elif eg < -10: score -= 1; notes.append(f"Declining growth {eg:.1f}% ✗")
-        if fcf > 0 and (fcf / mc) > 0.03: score += 1; notes.append("Strong FCF yield ✓")
+        roe = info.get("returnOnEquity")
+        if roe:
+            if roe > 0.20:
+                score += 1; details.append(f"ROE {roe*100:.1f}% — strong returns")
+            elif roe < 0:
+                score -= 1; details.append(f"ROE {roe*100:.1f}% — negative returns")
 
-        # SEC EDGAR insider data via yfinance
-        try:
-            stock   = yf.Ticker(ticker)
-            insider = stock.insider_transactions
-            if insider is not None and not insider.empty:
-                buys  = insider[insider.get("Transaction", insider.get("transaction","")).str.contains("Buy|Purchase", case=False, na=False)]
-                sells = insider[insider.get("Transaction", insider.get("transaction","")).str.contains("Sale|Sell", case=False, na=False)]
-                if len(buys) >= 2: score += 1; notes.append(f"Insiders buying ({len(buys)} txns) ✓")
-                elif len(sells) > len(buys) + 2: score -= 1; notes.append(f"Insiders selling ✗")
-        except Exception:
-            pass
+        de = info.get("debtToEquity")
+        if de:
+            if de < 50:
+                score += 0.5; details.append(f"D/E {de:.0f}% — low leverage")
+            elif de > 200:
+                score -= 1; details.append(f"D/E {de:.0f}% — high leverage")
 
-        verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
-        return {"agent": "Fundamentals", "score": score, "verdict": verdict,
-                "details": " · ".join(notes) or "No signals", "weight": 1.2}
+        eg = info.get("earningsGrowth")
+        if eg:
+            if eg > 0.15:
+                score += 1; details.append(f"Earnings growth {eg*100:.1f}% — strong")
+            elif eg < 0:
+                score -= 1; details.append(f"Earnings growth {eg*100:.1f}% — declining")
+
+        # SEC insider data — cached per ticker
+        buys, sells = _cached_insider_data(ticker)
+        if buys > sells * 1.5 and buys > 0:
+            score += 1; details.append(f"Insider net buying ${buys/1e6:.1f}M (SEC EDGAR)")
+        elif sells > buys * 1.5 and sells > 0:
+            score -= 0.5; details.append(f"Insider net selling ${sells/1e6:.1f}M (SEC EDGAR)")
+
+        if not details:
+            details.append("Fundamental data unavailable")
+
+        return {"name": "Fundamentals & Insider", "score": score, "weight": 1.2,
+                "details": details, "icon": "📊"}
     except Exception as e:
-        return {"agent": "Fundamentals", "score": 0, "verdict": "NEUTRAL", "details": str(e), "weight": 1.2}
+        return {"name": "Fundamentals & Insider", "score": 0, "weight": 1.2,
+                "details": [f"Error: {e}"], "icon": "📊"}
 
 
-# ── Agent 3: Sentiment Agent (Finnhub + Reddit + yfinance news) ───────────────
 def _agent_sentiment(ticker: str) -> dict:
-    score = 0
-    notes = []
-    cfg   = load_config()
+    try:
+        score = 0.0
+        details = []
+        cfg = load_config()
 
-    # Finnhub news sentiment
-    finnhub_key = cfg.get("finnhub_api_key", "")
-    if finnhub_key:
-        try:
-            import urllib.request, datetime
-            end   = datetime.date.today().isoformat()
-            start = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
-            url   = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={start}&to={end}&token={finnhub_key}"
-            with urllib.request.urlopen(url, timeout=5) as r:
-                articles = json.loads(r.read())
-            pos = sum(1 for a in articles if any(w in a.get("headline","").lower()
-                      for w in ["beat","surge","growth","upgrade","record","strong"]))
-            neg = sum(1 for a in articles if any(w in a.get("headline","").lower()
-                      for w in ["miss","decline","downgrade","lawsuit","recall","loss"]))
-            if pos > neg + 2:   score += 2; notes.append(f"Finnhub: {pos} positive headlines ✓")
-            elif neg > pos + 2: score -= 2; notes.append(f"Finnhub: {neg} negative headlines ✗")
-            else:                notes.append(f"Finnhub: mixed news ({pos}+ {neg}-)")
+        # Finnhub news sentiment
+        finnhub_key = cfg.get("finnhub_api_key", "")
+        if finnhub_key:
+            try:
+                import urllib.request, datetime as _dt
+                from_date = (_dt.date.today() - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+                to_date   = _dt.date.today().strftime("%Y-%m-%d")
+                url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={from_date}&to={to_date}&token={finnhub_key}"
+                with urllib.request.urlopen(url, timeout=3) as r:
+                    articles = json.loads(r.read())
+                pos = sum(1 for a in articles if any(w in a.get("headline","").lower() for w in ["beat","surge","rally","strong","growth","record"]))
+                neg = sum(1 for a in articles if any(w in a.get("headline","").lower() for w in ["miss","fall","decline","weak","loss","cut","layoff"]))
+                if articles:
+                    if pos > neg:
+                        score += 1; details.append(f"Finnhub: {pos} positive vs {neg} negative headlines")
+                    elif neg > pos:
+                        score -= 1; details.append(f"Finnhub: {neg} negative vs {pos} positive headlines")
+                    else:
+                        details.append(f"Finnhub: mixed sentiment ({len(articles)} articles)")
 
-            # Analyst recommendations from Finnhub
-            url2 = f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={finnhub_key}"
-            with urllib.request.urlopen(url2, timeout=5) as r2:
-                recs = json.loads(r2.read())
-            if recs:
-                latest = recs[0]
-                strong_buy = latest.get("strongBuy", 0)
-                buy        = latest.get("buy", 0)
-                sell       = latest.get("sell", 0) + latest.get("strongSell", 0)
-                if strong_buy + buy > sell * 2: score += 1; notes.append(f"Analysts bullish ({strong_buy+buy} buy vs {sell} sell) ✓")
-                elif sell > strong_buy + buy:   score -= 1; notes.append(f"Analysts bearish ({sell} sell) ✗")
-        except Exception as e:
-            notes.append(f"Finnhub unavailable")
+                # Analyst ratings
+                url2 = f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={finnhub_key}"
+                with urllib.request.urlopen(url2, timeout=5) as r:
+                    recs = json.loads(r.read())
+                if recs:
+                    latest_rec = recs[0]
+                    strong_buy = latest_rec.get("strongBuy", 0)
+                    buy = latest_rec.get("buy", 0)
+                    hold = latest_rec.get("hold", 0)
+                    sell = latest_rec.get("sell", 0) + latest_rec.get("strongSell", 0)
+                    bullish_analysts = strong_buy + buy
+                    if bullish_analysts > sell * 2:
+                        score += 1; details.append(f"Analysts: {bullish_analysts} buy vs {sell} sell")
+                    elif sell > bullish_analysts:
+                        score -= 1; details.append(f"Analysts: {sell} sell vs {bullish_analysts} buy")
+            except Exception:
+                pass
 
-    # Reddit WSB/stocks sentiment
-    reddit_id     = cfg.get("reddit_client_id", "")
-    reddit_secret = cfg.get("reddit_secret", "")
-    if reddit_id and reddit_secret:
-        try:
-            import urllib.request, urllib.parse, base64
-            auth = base64.b64encode(f"{reddit_id}:{reddit_secret}".encode()).decode()
-            tok_req = urllib.request.Request(
-                "https://www.reddit.com/api/v1/access_token",
-                data=urllib.parse.urlencode({"grant_type": "client_credentials"}).encode(),
-                headers={"Authorization": f"Basic {auth}", "User-Agent": "TradeRadar/1.0"}
-            )
-            tok_req.get_method = lambda: "POST"
-            with urllib.request.urlopen(tok_req, timeout=5) as tr:
-                token = json.loads(tr.read()).get("access_token", "")
-            if token:
-                search_req = urllib.request.Request(
-                    f"https://oauth.reddit.com/r/wallstreetbets+stocks/search?q={ticker}&sort=new&limit=25&t=week",
-                    headers={"Authorization": f"Bearer {token}", "User-Agent": "TradeRadar/1.0"}
+        # Reddit WSB/stocks
+        reddit_id = cfg.get("reddit_client_id", "")
+        reddit_secret = cfg.get("reddit_secret", "")
+        if reddit_id and reddit_secret:
+            try:
+                import urllib.request, urllib.parse, base64
+                creds = base64.b64encode(f"{reddit_id}:{reddit_secret}".encode()).decode()
+                token_req = urllib.request.Request(
+                    "https://www.reddit.com/api/v1/access_token",
+                    data=b"grant_type=client_credentials",
+                    headers={"Authorization": f"Basic {creds}", "User-Agent": "TradeRadar/1.0"}
                 )
-                with urllib.request.urlopen(search_req, timeout=5) as sr:
-                    posts = json.loads(sr.read()).get("data", {}).get("children", [])
-                bull = sum(1 for p in posts if any(w in p["data"].get("title","").lower()
-                           for w in ["bullish","buy","calls","moon","🚀","long"]))
-                bear = sum(1 for p in posts if any(w in p["data"].get("title","").lower()
-                           for w in ["bearish","puts","short","crash","dump","🌈🐻"]))
-                if bull > bear + 3:   score += 1; notes.append(f"Reddit bullish ({bull} posts) ✓")
-                elif bear > bull + 3: score -= 1; notes.append(f"Reddit bearish ({bear} posts) ✗")
-                else:                  notes.append(f"Reddit neutral")
-        except Exception:
-            notes.append("Reddit unavailable")
+                with urllib.request.urlopen(token_req, timeout=5) as r:
+                    token_data = json.loads(r.read())
+                access_token = token_data.get("access_token", "")
+                if access_token:
+                    mentions = 0
+                    bull_words, bear_words = 0, 0
+                    for sub in ["wallstreetbets", "stocks"]:
+                        search_url = f"https://oauth.reddit.com/r/{sub}/search?q={ticker}&sort=new&limit=25&t=week"
+                        req2 = urllib.request.Request(search_url, headers={
+                            "Authorization": f"bearer {access_token}",
+                            "User-Agent": "TradeRadar/1.0"
+                        })
+                        with urllib.request.urlopen(req2, timeout=5) as r2:
+                            data2 = json.loads(r2.read())
+                        posts = data2.get("data", {}).get("children", [])
+                        mentions += len(posts)
+                        for p in posts:
+                            t = (p.get("data", {}).get("title", "") + " " + p.get("data", {}).get("selftext", "")).lower()
+                            bull_words += sum(t.count(w) for w in ["buy","bullish","moon","squeeze","long","calls"])
+                            bear_words += sum(t.count(w) for w in ["sell","bearish","short","puts","crash","dump"])
+                    if mentions > 0:
+                        if bull_words > bear_words:
+                            score += 0.5; details.append(f"Reddit: {mentions} posts, bullish bias ({bull_words} vs {bear_words})")
+                        elif bear_words > bull_words:
+                            score -= 0.5; details.append(f"Reddit: {mentions} posts, bearish bias ({bear_words} vs {bull_words})")
+                        else:
+                            details.append(f"Reddit: {mentions} posts, neutral")
+            except Exception:
+                pass
 
-    # Fallback: yfinance news
-    if not finnhub_key:
-        try:
-            news = yf.Ticker(ticker).news or []
-            pos = neg = 0
-            for n in news[:10]:
-                t = n.get("content", {}).get("title", "").lower()
-                if any(w in t for w in ["beat","surge","growth","upgrade","strong"]): pos += 1
-                if any(w in t for w in ["miss","decline","downgrade","lawsuit","loss"]): neg += 1
-            if pos > neg + 1:   score += 1; notes.append(f"News positive ({pos} articles) ✓")
-            elif neg > pos + 1: score -= 1; notes.append(f"News negative ({neg} articles) ✗")
-            else:                notes.append("News mixed")
-        except Exception:
-            pass
+        # Fallback: yfinance news keyword scoring
+        if not details:
+            try:
+                news = yf.Ticker(ticker).news or []
+                pos, neg = 0, 0
+                for a in news[:10]:
+                    h = a.get("content", {}).get("title", "").lower()
+                    pos += sum(1 for w in ["beat","surge","rally","strong","record","growth"] if w in h)
+                    neg += sum(1 for w in ["miss","fall","weak","loss","decline","cut"] if w in h)
+                if pos > neg:
+                    score += 0.5; details.append(f"News keywords: {pos} positive vs {neg} negative")
+                elif neg > pos:
+                    score -= 0.5; details.append(f"News keywords: {neg} negative vs {pos} positive")
+                else:
+                    details.append("News sentiment: neutral")
+            except Exception:
+                details.append("Sentiment data unavailable")
 
-    verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
-    return {"agent": "Sentiment", "score": score, "verdict": verdict,
-            "details": " · ".join(notes) or "No sentiment data", "weight": 1.0}
+        return {"name": "Sentiment & Social", "score": score, "weight": 1.0,
+                "details": details, "icon": "💬"}
+    except Exception as e:
+        return {"name": "Sentiment & Social", "score": 0, "weight": 1.0,
+                "details": [f"Error: {e}"], "icon": "💬"}
 
 
-# ── Agent 4: Macro Agent (FRED + VIX) ─────────────────────────────────────────
-def _agent_macro() -> dict:
-    score = 0
-    notes = []
-    cfg   = load_config()
-    fred_key = cfg.get("fred_api_key", "")
-
-    if fred_key:
-        try:
-            import urllib.request
-            def fred(series):
-                url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series}&sort_order=desc&limit=2&api_key={fred_key}&file_type=json"
-                with urllib.request.urlopen(url, timeout=5) as r:
-                    obs = json.loads(r.read())["observations"]
-                return [float(o["value"]) for o in obs if o["value"] != "."]
-
-            # Fed Funds Rate trend
-            ff = fred("FEDFUNDS")
-            if len(ff) >= 2:
-                if ff[0] < ff[1]:   score += 1; notes.append(f"Fed cutting rates ({ff[0]:.2f}%) ✓")
-                elif ff[0] > ff[1]: score -= 1; notes.append(f"Fed hiking rates ({ff[0]:.2f}%) ✗")
-                else:                notes.append(f"Fed rates stable ({ff[0]:.2f}%)")
-
-            # Inflation (CPI)
-            cpi = fred("CPIAUCSL")
-            if len(cpi) >= 2:
-                cpi_chg = (cpi[0] - cpi[1]) / cpi[1] * 100 * 12
-                if cpi_chg < 2.5:   score += 1; notes.append(f"Inflation cooling {cpi_chg:.1f}% ✓")
-                elif cpi_chg > 4.0: score -= 1; notes.append(f"Inflation hot {cpi_chg:.1f}% ✗")
-                else:                notes.append(f"Inflation moderate {cpi_chg:.1f}%")
-
-            # Unemployment
-            ue = fred("UNRATE")
-            if ue:
-                if ue[0] < 4.5:   score += 1; notes.append(f"Unemployment low {ue[0]:.1f}% ✓")
-                elif ue[0] > 6.0: score -= 1; notes.append(f"Unemployment high {ue[0]:.1f}% ✗")
-
-        except Exception:
-            notes.append("FRED unavailable")
-
-    # Always check VIX (free via yfinance)
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_market_regime():
+    """VIX + SPY trend are market-wide — same for every ticker. Cache 5 min."""
+    vix_val, spy_bull = None, None
     try:
-        vix_hist = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
+        vix_hist = yf.download("^VIX", period="5d", interval="1d", progress=False, auto_adjust=True)
         if not vix_hist.empty:
-            vix = float(vix_hist["Close"].iloc[-1])
-            if vix < 15:   score += 1; notes.append(f"VIX low {vix:.1f} (calm market) ✓")
-            elif vix > 30: score -= 2; notes.append(f"VIX high {vix:.1f} (fear elevated) ✗")
-            elif vix > 20: score -= 1; notes.append(f"VIX elevated {vix:.1f}")
-            else:           notes.append(f"VIX normal {vix:.1f}")
-    except Exception:
-        notes.append("VIX unavailable")
-
-    # SPY trend
-    try:
-        spy = yf.download("SPY", period="3mo", progress=False, auto_adjust=True)
-        if not spy.empty and len(spy) >= 50:
-            sma20 = spy["Close"].rolling(20).mean().iloc[-1]
-            sma50 = spy["Close"].rolling(50).mean().iloc[-1]
-            if float(sma20) > float(sma50): score += 1; notes.append("SPY uptrend ✓")
-            else:                            score -= 1; notes.append("SPY downtrend ✗")
+            vix_val = float(vix_hist["Close"].iloc[-1])
     except Exception:
         pass
+    try:
+        spy = yf.download("SPY", period="3mo", interval="1d", progress=False, auto_adjust=True)
+        if not spy.empty and len(spy) >= 50:
+            c = spy["Close"].squeeze()
+            spy_bull = float(c.rolling(20).mean().iloc[-1]) > float(c.rolling(50).mean().iloc[-1])
+    except Exception:
+        pass
+    return vix_val, spy_bull
 
-    verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
-    return {"agent": "Macro", "score": score, "verdict": verdict,
-            "details": " · ".join(notes) or "No macro data", "weight": 0.8}
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _cached_insider_data(ticker: str):
+    """SEC EDGAR insider buy/sell totals via yfinance. Cache 10 min."""
+    try:
+        ins = yf.Ticker(ticker).insider_transactions
+        if ins is not None and not ins.empty and "Value" in ins.columns:
+            recent = ins.head(10)
+            buys  = float(recent[recent["Value"] > 0]["Value"].sum())
+            sells = float(abs(recent[recent["Value"] < 0]["Value"].sum()))
+            return buys, sells
+    except Exception:
+        pass
+    return 0.0, 0.0
 
 
-# ── Agent 5: Options Flow Agent (yfinance) ────────────────────────────────────
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_options_summary(ticker: str):
+    """Options chain P/C ratio — nearest expiry. Cache 1 min."""
+    try:
+        stk = yf.Ticker(ticker)
+        expirations = stk.options
+        if not expirations:
+            return None
+        exp   = expirations[0]
+        chain = stk.option_chain(exp)
+        calls_oi = int(chain.calls["openInterest"].sum()) if "openInterest" in chain.calls.columns else 0
+        puts_oi  = int(chain.puts["openInterest"].sum())  if "openInterest" in chain.puts.columns else 0
+        return {"exp": exp, "calls_oi": calls_oi, "puts_oi": puts_oi}
+    except Exception:
+        return None
+
+
+def _agent_macro() -> dict:
+    try:
+        score = 0.0
+        details = []
+        cfg = load_config()
+        fred_key = cfg.get("fred_api_key", "")
+
+        if fred_key:
+            try:
+                import urllib.request
+                for series_id, label, low_good, high_bad in [
+                    ("FEDFUNDS", "Fed Funds Rate", 3.0, 5.5),
+                    ("CPIAUCSL", "CPI Inflation", 2.0, 4.0),
+                    ("UNRATE",   "Unemployment",  4.5, 6.0),
+                ]:
+                    url = (f"https://api.stlouisfed.org/fred/series/observations"
+                           f"?series_id={series_id}&api_key={fred_key}&file_type=json"
+                           f"&sort_order=desc&limit=1")
+                    with urllib.request.urlopen(url, timeout=3) as r:
+                        data = json.loads(r.read())
+                    val = float(data["observations"][0]["value"])
+                    if val <= low_good:
+                        score += 0.5; details.append(f"FRED {label}: {val:.2f}% — favourable")
+                    elif val >= high_bad:
+                        score -= 0.5; details.append(f"FRED {label}: {val:.2f}% — headwind")
+                    else:
+                        details.append(f"FRED {label}: {val:.2f}% — neutral")
+            except Exception:
+                pass
+
+        # VIX + SPY — from shared cache (downloaded once, reused across all tickers)
+        vix_val, spy_bull = _cached_market_regime()
+        if vix_val is not None:
+            if vix_val < 20:
+                score += 1; details.append(f"VIX {vix_val:.1f} — low fear, bullish environment")
+            elif vix_val > 30:
+                score -= 1; details.append(f"VIX {vix_val:.1f} — high fear, risk-off market")
+            else:
+                details.append(f"VIX {vix_val:.1f} — moderate volatility")
+        if spy_bull is not None:
+            if spy_bull:
+                score += 0.5; details.append("SPY: broad market uptrend (SMA20 > SMA50)")
+            else:
+                score -= 0.5; details.append("SPY: broad market downtrend (SMA20 < SMA50)")
+
+        if not details:
+            details.append("Macro data unavailable")
+
+        return {"name": "Macro Environment", "score": score, "weight": 0.8,
+                "details": details, "icon": "🌍"}
+    except Exception as e:
+        return {"name": "Macro Environment", "score": 0, "weight": 0.8,
+                "details": [f"Error: {e}"], "icon": "🌍"}
+
+
 def _agent_options_flow(ticker: str, price: float) -> dict:
     try:
-        stock   = yf.Ticker(ticker)
-        expiries = stock.options
-        if not expiries:
-            return {"agent": "Options Flow", "score": 0, "verdict": "NEUTRAL",
-                    "details": "No options data", "weight": 0.7}
-        chain  = stock.option_chain(expiries[0])
-        calls_vol = chain.calls["volume"].fillna(0).sum()
-        puts_vol  = chain.puts["volume"].fillna(0)
-        puts_total = puts_vol.sum()
-        pc_ratio  = puts_total / calls_vol if calls_vol > 0 else 1.0
+        score = 0.0
+        details = []
+        opt = _cached_options_summary(ticker)
+        if opt is None:
+            return {"name": "Options Flow", "score": 0, "weight": 0.7,
+                    "details": ["No options data available"], "icon": "🎯"}
 
-        # Unusual options activity
-        calls_oi  = chain.calls["openInterest"].fillna(0).sum()
-        puts_oi   = chain.puts["openInterest"].fillna(0).sum()
-        itm_calls = chain.calls[chain.calls["strike"] < price]["volume"].fillna(0).sum()
+        calls_oi = opt["calls_oi"]
+        puts_oi  = opt["puts_oi"]
+        exp      = opt["exp"]
 
-        score = 0
-        notes = []
-        if pc_ratio < 0.5:   score += 2; notes.append(f"P/C ratio {pc_ratio:.2f} (heavy call buying) ✓")
-        elif pc_ratio < 0.7: score += 1; notes.append(f"P/C ratio {pc_ratio:.2f} (call bias) ✓")
-        elif pc_ratio > 1.5: score -= 2; notes.append(f"P/C ratio {pc_ratio:.2f} (heavy put buying) ✗")
-        elif pc_ratio > 1.2: score -= 1; notes.append(f"P/C ratio {pc_ratio:.2f} (put bias) ✗")
-        else:                 notes.append(f"P/C ratio neutral {pc_ratio:.2f}")
+        if calls_oi + puts_oi > 0:
+            pc_ratio = puts_oi / max(calls_oi, 1)
+            if pc_ratio < 0.7:
+                score += 1; details.append(f"P/C ratio {pc_ratio:.2f} — bullish call dominance")
+            elif pc_ratio > 1.3:
+                score -= 1; details.append(f"P/C ratio {pc_ratio:.2f} — bearish put dominance")
+            else:
+                details.append(f"P/C ratio {pc_ratio:.2f} — balanced options flow")
+            details.append(f"Calls OI: {calls_oi:,} | Puts OI: {puts_oi:,} (exp {exp})")
+        else:
+            details.append("Options OI data unavailable")
 
-        if calls_oi > puts_oi * 1.5: score += 1; notes.append("More call open interest ✓")
-        elif puts_oi > calls_oi * 1.5: score -= 1; notes.append("More put open interest ✗")
-
-        verdict = "BULLISH" if score >= 1 else "BEARISH" if score <= -1 else "NEUTRAL"
-        return {"agent": "Options Flow", "score": score, "verdict": verdict,
-                "details": " · ".join(notes), "weight": 0.7}
+        return {"name": "Options Flow", "score": score, "weight": 0.7,
+                "details": details, "icon": "🎯"}
     except Exception as e:
-        return {"agent": "Options Flow", "score": 0, "verdict": "NEUTRAL",
-                "details": "Options data unavailable", "weight": 0.7}
+        return {"name": "Options Flow", "score": 0, "weight": 0.7,
+                "details": [f"Error: {e}"], "icon": "🎯"}
 
 
-# ── Consolidator ──────────────────────────────────────────────────────────────
-def run_multi_agent_analysis(ticker: str, df: pd.DataFrame, info: dict = None) -> dict:
-    """
-    Run all agents in parallel, consolidate into a single verdict.
-    Returns dict with overall score, verdict, and per-agent breakdown.
-    """
-    price = float(df["Close"].iloc[-1]) if df is not None and not df.empty else 0
+def run_multi_agent_analysis(ticker: str, df: pd.DataFrame, info: dict) -> dict:
+    price = float(df["Close"].squeeze().iloc[-1])
+    futures_map = {}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures_map[executor.submit(_agent_technical, ticker, df)]      = "technical"
+        futures_map[executor.submit(_agent_fundamentals, ticker, info)] = "fundamentals"
+        futures_map[executor.submit(_agent_sentiment, ticker)]          = "sentiment"
+        futures_map[executor.submit(_agent_macro)]                      = "macro"
+        futures_map[executor.submit(_agent_options_flow, ticker, price)]= "options"
 
-    tasks = {
-        "technical":    lambda: _agent_technical(ticker, df),
-        "fundamentals": lambda: _agent_fundamentals(ticker, info),
-        "sentiment":    lambda: _agent_sentiment(ticker),
-        "macro":        lambda: _agent_macro(),
-        "options":      lambda: _agent_options_flow(ticker, price),
-    }
+    agents = []
+    for future in as_completed(futures_map):
+        try:
+            agents.append(future.result())
+        except Exception as e:
+            agents.append({"name": futures_map[future], "score": 0, "weight": 1.0,
+                           "details": [str(e)], "icon": "❓"})
 
-    results = {}
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        futures = {ex.submit(fn): name for name, fn in tasks.items()}
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                results[name] = future.result()
-            except Exception as e:
-                results[name] = {"agent": name, "score": 0, "verdict": "NEUTRAL",
-                                 "details": str(e), "weight": 1.0}
+    weighted_score = sum(a["score"] * a["weight"] for a in agents)
+    total_weight   = sum(a["weight"] for a in agents)
+    final_score    = weighted_score / total_weight if total_weight else 0
 
-    # Weighted consolidation
-    total_weight = sum(r.get("weight", 1.0) for r in results.values())
-    weighted_score = sum(r["score"] * r.get("weight", 1.0) for r in results.values())
-    final_score = weighted_score / total_weight if total_weight else 0
+    bullish = sum(1 for a in agents if a["score"] > 0)
+    bearish = sum(1 for a in agents if a["score"] < 0)
 
-    bullish = sum(1 for r in results.values() if r["verdict"] == "BULLISH")
-    bearish = sum(1 for r in results.values() if r["verdict"] == "BEARISH")
-
-    if final_score >= 1.5:   verdict, color = "STRONG BUY",  "#00e676"
-    elif final_score >= 0.5: verdict, color = "BUY",         "#69f0ae"
-    elif final_score >= -0.5:verdict, color = "HOLD",        "#ffd740"
-    elif final_score >= -1.5:verdict, color = "SELL",        "#ff6d00"
-    else:                     verdict, color = "STRONG SELL", "#ff1744"
+    if final_score >= 1.5:
+        verdict, color = "STRONG BUY", "#00c853"
+    elif final_score >= 0.5:
+        verdict, color = "BUY", "#69f0ae"
+    elif final_score > -0.5:
+        verdict, color = "HOLD", "#ffd740"
+    elif final_score > -1.5:
+        verdict, color = "SELL", "#ff6d00"
+    else:
+        verdict, color = "STRONG SELL", "#d50000"
 
     return {
-        "verdict":      verdict,
-        "color":        color,
-        "final_score":  round(final_score, 2),
+        "verdict": verdict,
+        "color": color,
+        "final_score": final_score,
         "bullish_count": bullish,
         "bearish_count": bearish,
-        "agents":       list(results.values()),
+        "agents": agents,
     }
 
 
-def show_multi_agent_panel(ticker: str, df: pd.DataFrame, info: dict = None):
-    """Render the multi-agent analysis panel in the UI."""
-    with st.spinner("Running multi-agent analysis..."):
-        result = run_multi_agent_analysis(ticker, df, info)
+@st.cache_data(ttl=300, show_spinner=False)
+def _cached_multi_agent_result(ticker: str, last_close: float, _df: pd.DataFrame, _info: dict) -> dict:
+    """Cache the full analysis result per ticker + price. Re-runs only when price changes."""
+    return run_multi_agent_analysis(ticker, _df, _info)
+
+
+def show_multi_agent_panel(ticker: str, df: pd.DataFrame, info: dict):
+    last_close = float(df["Close"].squeeze().iloc[-1])
+    with st.spinner("Running 5-agent parallel analysis…"):
+        result = _cached_multi_agent_result(ticker, last_close, df, info)
 
     verdict = result["verdict"]
     color   = result["color"]
     score   = result["final_score"]
-    bull    = result["bullish_count"]
-    bear    = result["bearish_count"]
-    neutral = len(result["agents"]) - bull - bear
+    bullish = result["bullish_count"]
+    bearish = result["bearish_count"]
 
-    st.markdown(f"""
-<div style="background:#111;border:2px solid {color};border-radius:12px;padding:16px;margin:12px 0;">
-  <div style="font-size:1.6em;font-weight:bold;color:{color};text-align:center;">{verdict}</div>
-  <div style="text-align:center;color:#aaa;margin-top:4px;">
-    Consolidated score: <b style="color:#fff;">{score:+.2f}</b> &nbsp;|&nbsp;
-    🟢 {bull} Bullish &nbsp; 🔴 {bear} Bearish &nbsp; ⚪ {neutral} Neutral
-  </div>
-</div>
-""", unsafe_allow_html=True)
+    st.markdown(
+        f"""<div style="background:{color}22;border-left:5px solid {color};
+        border-radius:8px;padding:14px 18px;margin-bottom:12px;">
+        <span style="font-size:1.5em;font-weight:bold;color:{color};">{verdict}</span>
+        &nbsp;&nbsp;<span style="color:#ccc;font-size:0.9em;">
+        Weighted score: {score:+.2f} &nbsp;|&nbsp;
+        {bullish} agent(s) bullish · {bearish} agent(s) bearish
+        </span></div>""",
+        unsafe_allow_html=True,
+    )
 
     with st.expander("🔍 Agent Breakdown", expanded=False):
-        agent_colors = {"BULLISH": "#00e676", "BEARISH": "#ff5252", "NEUTRAL": "#ffd740"}
-        for agent in result["agents"]:
-            ac = agent_colors.get(agent["verdict"], "#aaa")
-            st.markdown(f"""
-<div style="border-left:4px solid {ac};padding:8px 12px;margin:6px 0;background:#1a1a1a;border-radius:4px;">
-  <span style="color:{ac};font-weight:bold;">{agent['agent']}</span>
-  <span style="color:#aaa;font-size:0.85em;margin-left:8px;">{agent['verdict']} · score {agent['score']:+d}</span><br>
-  <span style="color:#ccc;font-size:0.82em;">{agent['details']}</span>
-</div>
-""", unsafe_allow_html=True)
+        for agent in sorted(result["agents"], key=lambda a: -abs(a["score"])):
+            s = agent["score"]
+            border = "#00c853" if s > 0 else ("#d50000" if s < 0 else "#888")
+            badge  = f"{'▲' if s > 0 else ('▼' if s < 0 else '—')} {s:+.2f}"
+            st.markdown(
+                f"""<div style="border-left:4px solid {border};padding:8px 14px;
+                margin-bottom:8px;background:#1a1a1a;border-radius:4px;">
+                <b>{agent['icon']} {agent['name']}</b>
+                <span style="float:right;color:{border};font-weight:bold;">{badge}</span>
+                <br/><small style="color:#aaa;">{'<br/>'.join(agent['details'])}</small>
+                </div>""",
+                unsafe_allow_html=True,
+            )
 
 
-def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = ""):
+def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = "", trading_mode: str = "Long-Term Investing"):
     """
     Score each stock across 10 criteria. Max score ~+16, min ~-16.
     Technical (6 factors) + Fundamentals + News Sentiment + Options Flow + Sector Momentum.
@@ -1276,19 +1454,24 @@ def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = ""):
     latest = df.iloc[-1]
     prev   = df.iloc[-2]
     signals, score = [], 0
+    is_day = trading_mode == "Day Trading"
 
     # ── 1. RSI (max ±3) ─────────────────────────────────────────────────────
     rsi = latest["RSI"]
-    if rsi < 30:
+    low_strong = 28 if is_day else 30
+    low_buy = 40 if is_day else 40
+    high_strong = 72 if is_day else 70
+    high_sell = 60 if is_day else 60
+    if rsi < low_strong:
         signals.append(("RSI", "🟢 STRONG BUY", f"RSI={rsi:.1f} — deeply oversold (< 30)"))
         score += 3
-    elif rsi < 40:
+    elif rsi < low_buy:
         signals.append(("RSI", "🟢 BUY",        f"RSI={rsi:.1f} — oversold zone (30–40)"))
         score += 1
-    elif rsi > 70:
+    elif rsi > high_strong:
         signals.append(("RSI", "🔴 STRONG SELL", f"RSI={rsi:.1f} — deeply overbought (> 70)"))
         score -= 3
-    elif rsi > 60:
+    elif rsi > high_sell:
         signals.append(("RSI", "🔴 SELL",        f"RSI={rsi:.1f} — overbought zone (60–70)"))
         score -= 1
     else:
@@ -1316,17 +1499,28 @@ def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = ""):
 
     # ── 3. Moving Average Trend (max ±2) ────────────────────────────────────
     c, s20, s50 = latest["Close"], latest["SMA_20"], latest["SMA_50"]
-    sma20_slope = (df["SMA_20"].iloc[-1] - df["SMA_20"].iloc[-5]) / df["SMA_20"].iloc[-5] * 100
-    if c > s20 and s20 > s50 and sma20_slope > 0:
-        signals.append(("Trend (MA)", "🟢 BUY", f"Price > SMA20 > SMA50, SMA20 rising (+{sma20_slope:.2f}%) — confirmed uptrend")); score += 2
-    elif c > s20 and s20 > s50:
-        signals.append(("Trend (MA)", "🟢 BUY", "Price > SMA20 > SMA50 — uptrend (SMA20 flattening)")); score += 1
-    elif c < s20 and s20 < s50 and sma20_slope < 0:
-        signals.append(("Trend (MA)", "🔴 SELL", f"Price < SMA20 < SMA50, SMA20 falling ({sma20_slope:.2f}%) — confirmed downtrend")); score -= 2
-    elif c < s20 and s20 < s50:
-        signals.append(("Trend (MA)", "🔴 SELL", "Price < SMA20 < SMA50 — downtrend (SMA20 flattening)")); score -= 1
+    if is_day:
+        e9, e21 = latest["EMA_9"], latest["EMA_21"]
+        if c > e9 > e21:
+            signals.append(("Trend (EMA)", "🟢 BUY", "Price > EMA9 > EMA21 — short-term trend aligned up")); score += 2
+        elif c < e9 < e21:
+            signals.append(("Trend (EMA)", "🔴 SELL", "Price < EMA9 < EMA21 — short-term trend aligned down")); score -= 2
+        elif c > e9:
+            signals.append(("Trend (EMA)", "⚪ NEUTRAL-BULL", "Price above EMA9 but trend not fully aligned")); score += 1
+        else:
+            signals.append(("Trend (EMA)", "⚪ NEUTRAL-BEAR", "Price below EMA9 but trend not fully aligned")); score -= 1
     else:
-        signals.append(("Trend (MA)", "⚪ NEUTRAL", "Mixed moving averages — no clear trend"))
+        sma20_slope = (df["SMA_20"].iloc[-1] - df["SMA_20"].iloc[-5]) / df["SMA_20"].iloc[-5] * 100
+        if c > s20 and s20 > s50 and sma20_slope > 0:
+            signals.append(("Trend (MA)", "🟢 BUY", f"Price > SMA20 > SMA50, SMA20 rising (+{sma20_slope:.2f}%) — confirmed uptrend")); score += 2
+        elif c > s20 and s20 > s50:
+            signals.append(("Trend (MA)", "🟢 BUY", "Price > SMA20 > SMA50 — uptrend (SMA20 flattening)")); score += 1
+        elif c < s20 and s20 < s50 and sma20_slope < 0:
+            signals.append(("Trend (MA)", "🔴 SELL", f"Price < SMA20 < SMA50, SMA20 falling ({sma20_slope:.2f}%) — confirmed downtrend")); score -= 2
+        elif c < s20 and s20 < s50:
+            signals.append(("Trend (MA)", "🔴 SELL", "Price < SMA20 < SMA50 — downtrend (SMA20 flattening)")); score -= 1
+        else:
+            signals.append(("Trend (MA)", "⚪ NEUTRAL", "Mixed moving averages — no clear trend"))
 
     # ── 4. Bollinger Bands (max ±1) ─────────────────────────────────────────
     bb_width = (latest["BB_upper"] - latest["BB_lower"]) / latest["BB_mid"]
@@ -1352,16 +1546,22 @@ def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = ""):
         signals.append(("Volume", "⚪ NEUTRAL", f"Normal volume ({vol_ratio:.1f}× avg)"))
 
     # ── 6. 5-day Momentum / ROC (max ±1) ────────────────────────────────────
-    roc = latest.get("ROC_5", 0.0) or 0.0
-    if roc > 4:
+    roc_col = "ROC_1" if is_day else "ROC_5"
+    roc = latest.get(roc_col, 0.0) or 0.0
+    if is_day and roc > 1.2:
+        signals.append(("Momentum (1d)", "🟢 BUY", f"1-day return = +{roc:.1f}% — intraday/short-term momentum strong")); score += 1
+    elif is_day and roc < -1.2:
+        signals.append(("Momentum (1d)", "🔴 SELL", f"1-day return = {roc:.1f}% — short-term momentum weak")); score -= 1
+    elif (not is_day) and roc > 4:
         signals.append(("Momentum (5d)", "🟢 BUY", f"5-day return = +{roc:.1f}% — strong upward momentum")); score += 1
-    elif roc < -4:
+    elif (not is_day) and roc < -4:
         signals.append(("Momentum (5d)", "🔴 SELL", f"5-day return = {roc:.1f}% — strong downward momentum")); score -= 1
     else:
-        signals.append(("Momentum (5d)", "⚪ NEUTRAL", f"5-day return = {roc:+.1f}% — neutral"))
+        span_lbl = "1d" if is_day else "5d"
+        signals.append((f"Momentum ({span_lbl})", "⚪ NEUTRAL", f"{span_lbl} return = {roc:+.1f}% — neutral"))
 
     # ── 7. Fundamentals (max ±2) — only when info dict provided ─────────────
-    if info:
+    if info and not is_day:
         fscore, fsigs = _fundamentals_score(info)
         score += fscore
         signals.extend(fsigs)
@@ -1381,7 +1581,7 @@ def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = ""):
         signals.append(("Options Flow", lbl, od))
 
     # ── 10. Sector Momentum (max ±1) ─────────────────────────────────────────
-    if ticker and info:
+    if ticker and info and not is_day:
         sm, sd = _sector_momentum_score(ticker, info, df)
         score += sm
         lbl = "🟢 BUY" if sm > 0 else ("🔴 SELL" if sm < 0 else "⚪ NEUTRAL")
@@ -1402,27 +1602,36 @@ def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = ""):
         signals.append(("Macro Regime", lbl, md))
 
     # ── 13. Short Interest — squeeze potential (max ±1) ──────────────────────
-    if info:
+    if info and not is_day:
         si, sid = _short_interest_score(info)
         score += si
         lbl = "🟢 BUY" if si > 0 else ("🔴 SELL" if si < 0 else "⚪ NEUTRAL")
         signals.append(("Short Interest", lbl, sid))
 
     # ── 14. Insider Activity (max ±1) ────────────────────────────────────────
-    if ticker:
+    if ticker and not is_day:
         ia, iad = _insider_activity_score(ticker)
         score += ia
         lbl = "🟢 BUY" if ia > 0 else ("🔴 SELL" if ia < 0 else "⚪ NEUTRAL")
         signals.append(("Insider Activity", lbl, iad))
 
     # ── Score → Label (expanded scale, max ~±20) ─────────────────────────────
-    if   score >= 10: label, color = "STRONG BUY",  "green"
-    elif score >= 5:  label, color = "BUY",          "green"
-    elif score >= 1:  label, color = "WEAK BUY",     "green"
-    elif score == 0:  label, color = "HOLD",         "gray"
-    elif score >= -4: label, color = "WEAK SELL",    "red"
-    elif score >= -9: label, color = "SELL",         "red"
-    else:             label, color = "STRONG SELL",  "red"
+    if is_day:
+        if   score >= 6: label, color = "STRONG BUY",  "green"
+        elif score >= 3: label, color = "BUY",          "green"
+        elif score >= 1: label, color = "WEAK BUY",     "green"
+        elif score == 0: label, color = "HOLD",         "gray"
+        elif score >= -2: label, color = "WEAK SELL",   "red"
+        elif score >= -5: label, color = "SELL",        "red"
+        else:             label, color = "STRONG SELL", "red"
+    else:
+        if   score >= 10: label, color = "STRONG BUY",  "green"
+        elif score >= 5:  label, color = "BUY",          "green"
+        elif score >= 1:  label, color = "WEAK BUY",     "green"
+        elif score == 0:  label, color = "HOLD",         "gray"
+        elif score >= -4: label, color = "WEAK SELL",    "red"
+        elif score >= -9: label, color = "SELL",         "red"
+        else:             label, color = "STRONG SELL",  "red"
 
     return signals, label, color, score
 
@@ -1469,9 +1678,11 @@ def get_trade_setup(df: pd.DataFrame, signal: str, current_price: float):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def get_stock_data(ticker: str, period: str):
+def get_stock_data(ticker: str, period: str, trading_mode: str = "Long-Term Investing"):
     stock = yf.Ticker(ticker)
-    return stock.history(period=period), stock.info
+    mode_cfg = _mode_settings(trading_mode)
+    interval = mode_cfg["interval"]
+    return stock.history(period=period, interval=interval), stock.info
 
 
 # ── Live Scrolling Ticker Bar ─────────────────────────────────────────────────
@@ -1604,7 +1815,7 @@ DIVIDEND_WATCHLIST = [
 ]
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def get_top_picks():
+def get_top_picks(trading_mode: str = "Long-Term Investing"):
     """Scan watchlist, return top 5 with STRONG BUY or BUY signal (score >= 4)."""
     try:
         raw = yf.download(
@@ -1621,7 +1832,7 @@ def get_top_picks():
             if hist.empty or len(hist) < 50:
                 continue
             hist = calculate_indicators(hist)
-            _, label, _, score = generate_signal(hist)
+            _, label, _, score = generate_signal(hist, trading_mode=trading_mode)
             # Require score >= 4 (genuine BUY, not just barely positive)
             if score >= 4:
                 latest = hist.iloc[-1]
@@ -1673,12 +1884,12 @@ def get_top_picks():
     return results
 
 
-def show_top_picks():
+def show_top_picks(trading_mode: str = "Long-Term Investing"):
     st.markdown("## 🔥 Today's Top 5 Stock Picks")
     st.caption("Scanned every 30 min · Score ≥ 4/10 required · 7 technical criteria · Not financial advice")
 
     with st.spinner("Scanning market..."):
-        picks = get_top_picks()
+        picks = get_top_picks(trading_mode=trading_mode)
 
     if not picks:
         st.info("No clear BUY signals found right now — market may be mixed. Try refreshing in 30 min.")
@@ -1954,7 +2165,7 @@ def get_top_dividend_picks():
             if dm["yield_pct"] == 0:
                 continue
             hist_ind = calculate_indicators(hist)
-            _, tech_label, _, tech_score = generate_signal(hist_ind)
+            _, tech_label, _, tech_score = generate_signal(hist_ind, trading_mode="Long-Term Investing")
             latest = hist.iloc[-1]
             prev   = hist.iloc[-2]
             chg    = (float(latest["Close"]) - float(prev["Close"])) / float(prev["Close"]) * 100
@@ -2001,7 +2212,7 @@ def save_portfolio(data: dict):
         json.dump(data, f, indent=2, default=str)
 
 
-def show_portfolio():
+def show_portfolio(trading_mode: str = "Long-Term Investing"):
     """Portfolio tracker — add holdings, track value, gain/loss, signals."""
     st.markdown("## 📂 My Portfolio")
     st.caption("Track your holdings · live value · gain/loss · dividend income · buy/sell signals")
@@ -2050,10 +2261,10 @@ def show_portfolio():
     with st.spinner("Loading live prices and signals..."):
         for t in tickers:
             try:
-                hist, info = get_stock_data(t, "3mo")
+                hist, info = get_stock_data(t, "3mo", trading_mode=trading_mode)
                 if not hist.empty:
                     hist_ind = calculate_indicators(hist)
-                    _, sig_lbl, _, sig_score = generate_signal(hist_ind, info=info, ticker=t)
+                    _, sig_lbl, _, sig_score = generate_signal(hist_ind, info=info, ticker=t, trading_mode=trading_mode)
                     live_data[t] = {
                         "price":     float(hist_ind.iloc[-1]["Close"]),
                         "info":      info,
@@ -2819,10 +3030,10 @@ You're betting that **{ticker}** will {direction} **${breakeven}** before {selec
 
 
 # ── Single-stock view ─────────────────────────────────────────────────────────
-def show_single_stock(ticker: str, period: str, resolved_from: str = ""):
+def show_single_stock(ticker: str, period: str, resolved_from: str = "", trading_mode: str = "Long-Term Investing"):
     with st.spinner(f"Fetching {ticker}..."):
         try:
-            hist, info = get_stock_data(ticker, period)
+            hist, info = get_stock_data(ticker, period, trading_mode=trading_mode)
         except Exception as e:
             st.error(f"Failed to fetch data: {e}")
             return
@@ -2835,7 +3046,7 @@ def show_single_stock(ticker: str, period: str, resolved_from: str = ""):
         st.info(f'"{resolved_from}" → **{ticker}** — {info.get("longName", ticker)}')
 
     hist = calculate_indicators(hist)
-    signals, overall, color, score = generate_signal(hist, info=info, ticker=ticker)
+    signals, overall, color, score = generate_signal(hist, info=info, ticker=ticker, trading_mode=trading_mode)
     latest, prev = hist.iloc[-1], hist.iloc[-2]
     change     = latest["Close"] - prev["Close"]
     change_pct = (change / prev["Close"]) * 100
@@ -2851,10 +3062,6 @@ def show_single_stock(ticker: str, period: str, resolved_from: str = ""):
     c4.metric("P/E Ratio",  f"{pe:.1f}" if isinstance(pe, float) else "N/A")
     c5.metric("52W Low",   f"${info.get('fiftyTwoWeekLow',0):.2f}"  if info.get('fiftyTwoWeekLow')  else "N/A")
     c6.metric("52W High",  f"${info.get('fiftyTwoWeekHigh',0):.2f}" if info.get('fiftyTwoWeekHigh') else "N/A")
-
-    # ── Multi-Agent Analysis Panel ───────────────────────────────────────────
-    st.markdown("### 🤖 Multi-Agent Analysis")
-    show_multi_agent_panel(ticker, hist, info)
 
     st.markdown("---")
 
@@ -3031,6 +3238,11 @@ def show_single_stock(ticker: str, period: str, resolved_from: str = ""):
     st.markdown("## 📊 Options Advisor")
     show_options(ticker, current_price, hist, overall)
 
+    # ── Multi-Agent Analysis ──────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🤖 Multi-Agent Analysis")
+    show_multi_agent_panel(ticker, hist, info)
+
     # ── News ──────────────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("📰 Recent News")
@@ -3091,8 +3303,214 @@ def show_single_stock(ticker: str, period: str, resolved_from: str = ""):
     show_ai_chat(system_context=ctx, chat_key=ticker)
 
 
+# ── Sector Laggard Scanner ────────────────────────────────────────────────────
+
+# Deduplicated sector list for the scanner dropdown
+_SCANNER_SECTORS = {
+    "Technology":          {"etf": "XLK",  "tickers": ["AAPL","MSFT","NVDA","GOOGL","META","AMZN","AMD","INTC","CRM","ORCL"]},
+    "Healthcare":          {"etf": "XLV",  "tickers": ["JNJ","UNH","LLY","PFE","ABBV","MRK","TMO","ABT","CVS","BMY"]},
+    "Financials":          {"etf": "XLF",  "tickers": ["JPM","BAC","WFC","GS","MS","C","BLK","AXP","V","MA"]},
+    "Energy":              {"etf": "XLE",  "tickers": ["XOM","CVX","COP","EOG","SLB","PXD","MPC","PSX","VLO","OXY"]},
+    "Consumer":            {"etf": "XLY",  "tickers": ["AMZN","HD","MCD","NKE","SBUX","TGT","COST","WMT","LOW","TJX"]},
+    "Industrials":         {"etf": "XLI",  "tickers": ["HON","UPS","CAT","DE","GE","MMM","RTX","LMT","BA","FDX"]},
+    "Utilities":           {"etf": "XLU",  "tickers": ["NEE","DUK","SO","D","AEP","EXC","SRE","XEL","ED","ES"]},
+    "Real Estate":         {"etf": "XLRE", "tickers": ["AMT","PLD","CCI","EQIX","PSA","O","WELL","SPG","DLR","AVB"]},
+    "Materials":           {"etf": "XLB",  "tickers": ["LIN","APD","ECL","SHW","FCX","NEM","VMC","MLM","NUE","CTVA"]},
+    "Communication Svcs":  {"etf": "XLC",  "tickers": ["GOOGL","META","NFLX","DIS","CMCSA","T","VZ","TMUS","CHTR","PARA"]},
+    "Semiconductors":      {"etf": "SOXX", "tickers": ["NVDA","AMD","INTC","QCOM","AVGO","MU","AMAT","LRCX","KLAC","TXN"]},
+    "Banks":               {"etf": "KBE",  "tickers": ["JPM","BAC","WFC","C","GS","MS","USB","PNC","TFC","COF"]},
+    "Electric Vehicles":   {"etf": "DRIV", "tickers": ["TSLA","RIVN","LCID","NIO","LI","XPEV","GM","F","STLA","FSR"]},
+    "AI / Cloud":          {"etf": "AIQ",  "tickers": ["NVDA","MSFT","GOOGL","META","AMZN","AMD","CRM","PLTR","SNOW","NOW"]},
+    "Biotech":             {"etf": "XBI",  "tickers": ["MRNA","REGN","BIIB","VRTX","GILD","BNTX","SGEN","ALNY","SRPT","PCVX"]},
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _scan_sector_laggards(sector_name: str, lookback_days: int = 20) -> list[dict]:
+    """
+    For every ticker in the sector, compute:
+      - absolute return over lookback_days
+      - gap vs the sector ETF return (relative performance)
+      - overall signal from generate_signal()
+    Returns list of row dicts sorted by gap ascending (worst laggards first).
+    """
+    cfg      = _SCANNER_SECTORS[sector_name]
+    etf_sym  = cfg["etf"]
+    tickers  = cfg["tickers"]
+    period   = "2mo"  # enough history for 20-day + indicators
+
+    # --- ETF benchmark ---
+    try:
+        etf_hist = yf.download(etf_sym, period=period, interval="1d",
+                               progress=False, auto_adjust=True)
+        if etf_hist.empty or len(etf_hist) < lookback_days:
+            etf_ret = 0.0
+        else:
+            c = etf_hist["Close"].squeeze()
+            etf_ret = float((c.iloc[-1] - c.iloc[-lookback_days]) / c.iloc[-lookback_days] * 100)
+    except Exception:
+        etf_ret = 0.0
+
+    rows = []
+    for sym in tickers:
+        try:
+            hist = yf.download(sym, period=period, interval="1d",
+                               progress=False, auto_adjust=True)
+            if hist.empty or len(hist) < lookback_days:
+                continue
+
+            hist    = calculate_indicators(hist)
+            close   = hist["Close"].squeeze()
+            price   = float(close.iloc[-1])
+            ret_20d = float((close.iloc[-1] - close.iloc[-lookback_days]) / close.iloc[-lookback_days] * 100)
+            gap     = ret_20d - etf_ret          # negative = lagging
+
+            info = {}
+            try:
+                info = yf.Ticker(sym).info or {}
+            except Exception:
+                pass
+
+            _, signal, color, score = generate_signal(hist, info=info, ticker=sym)
+
+            rows.append({
+                "ticker":   sym,
+                "price":    price,
+                "ret_20d":  ret_20d,
+                "etf_ret":  etf_ret,
+                "gap":      gap,
+                "signal":   signal,
+                "score":    score,
+                "color":    color,
+                "name":     info.get("shortName", sym),
+            })
+        except Exception:
+            continue
+
+    rows.sort(key=lambda r: r["gap"])  # worst laggards first
+    return rows
+
+
+def show_sector_laggard_scanner():
+    st.markdown("## 🔍 Sector Laggard Scanner")
+    st.caption("Finds stocks lagging their sector ETF — potential mean-reversion setups when signal turns bullish.")
+
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        sector_name = st.selectbox("Select Sector", list(_SCANNER_SECTORS.keys()), index=0)
+    with col2:
+        lookback = st.selectbox("Lookback Period", [10, 20, 30], index=1,
+                                format_func=lambda x: f"{x} days")
+
+    if st.button("🔍 Run Scanner", type="primary", use_container_width=True):
+        st.session_state["scanner_sector"]   = sector_name
+        st.session_state["scanner_lookback"] = lookback
+
+    run_sector   = st.session_state.get("scanner_sector",   sector_name)
+    run_lookback = st.session_state.get("scanner_lookback", lookback)
+
+    etf_sym = _SCANNER_SECTORS[run_sector]["etf"]
+    st.markdown(f"**Sector:** {run_sector} &nbsp;|&nbsp; **Benchmark ETF:** `{etf_sym}` &nbsp;|&nbsp; **Lookback:** {run_lookback} days")
+
+    with st.spinner(f"Scanning {run_sector} stocks vs {etf_sym}…"):
+        rows = _scan_sector_laggards(run_sector, run_lookback)
+
+    if not rows:
+        st.warning("No data returned. Try again in a moment.")
+        return
+
+    etf_ret = rows[0]["etf_ret"] if rows else 0.0
+
+    # ── Summary banner ────────────────────────────────────────────────────────
+    buy_laggards = [r for r in rows if r["gap"] < -3 and "BUY" in r["signal"]]
+    leaders      = [r for r in rows if r["gap"] > 3]
+    mid_col1, mid_col2, mid_col3, mid_col4 = st.columns(4)
+    mid_col1.metric(f"{etf_sym} {run_lookback}d Return", f"{etf_ret:+.2f}%")
+    mid_col2.metric("Stocks Scanned",        len(rows))
+    mid_col3.metric("Laggards (gap < −3%)",  len([r for r in rows if r["gap"] < -3]))
+    mid_col4.metric("🎯 BUY Laggards",       len(buy_laggards),
+                    help="Lagging ETF by >3% but signal is BUY — mean-reversion candidates")
+
+    # ── Opportunity callout ───────────────────────────────────────────────────
+    if buy_laggards:
+        st.success(
+            f"**{len(buy_laggards)} potential mean-reversion setup(s):** " +
+            ", ".join(f"**{r['ticker']}** ({r['gap']:+.1f}%)" for r in buy_laggards)
+        )
+
+    # ── Bar chart: relative performance ──────────────────────────────────────
+    bar_colors = []
+    for r in rows:
+        if r["gap"] < -3 and "BUY" in r["signal"]:
+            bar_colors.append("#00c853")   # green — laggard with buy signal
+        elif r["gap"] < -3:
+            bar_colors.append("#ff6d00")   # orange — laggard, no buy
+        elif r["gap"] > 3:
+            bar_colors.append("#42a5f5")   # blue — leader
+        else:
+            bar_colors.append("#888888")   # grey — neutral
+
+    fig = go.Figure(go.Bar(
+        x=[r["ticker"] for r in rows],
+        y=[r["gap"] for r in rows],
+        marker_color=bar_colors,
+        text=[f"{r['gap']:+.1f}%" for r in rows],
+        textposition="outside",
+        hovertemplate="<b>%{x}</b><br>Gap vs ETF: %{y:.2f}%<extra></extra>",
+    ))
+    fig.add_hline(y=0, line_dash="dash", line_color="#ffffff44", annotation_text=f"{etf_sym} baseline")
+    fig.update_layout(
+        title=f"{run_sector} — {run_lookback}d Return vs {etf_sym} (gap)",
+        xaxis_title="Ticker",
+        yaxis_title="Gap vs ETF (%)",
+        plot_bgcolor="#0e1117",
+        paper_bgcolor="#0e1117",
+        font_color="#fafafa",
+        height=380,
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Ranked table ──────────────────────────────────────────────────────────
+    st.markdown("### Ranked Table — Worst Laggards First")
+
+    legend_cols = st.columns(4)
+    legend_cols[0].markdown("🟢 **BUY Laggard** — opportunity")
+    legend_cols[1].markdown("🟠 **Laggard** — lagging >3%, no buy signal")
+    legend_cols[2].markdown("🔵 **Leader** — outperforming >3%")
+    legend_cols[3].markdown("⚪ **Neutral** — within ±3% of ETF")
+
+    for r in rows:
+        if r["gap"] < -3 and "BUY" in r["signal"]:
+            row_bg, badge = "#00c85318", "🟢"
+        elif r["gap"] < -3:
+            row_bg, badge = "#ff6d0018", "🟠"
+        elif r["gap"] > 3:
+            row_bg, badge = "#42a5f518", "🔵"
+        else:
+            row_bg, badge = "#88888818", "⚪"
+
+        sig_color = r["color"]
+        c1, c2, c3, c4, c5, c6 = st.columns([0.5, 1.2, 1.5, 1.2, 1.2, 1.5])
+        c1.markdown(badge)
+        c2.markdown(f"**{r['ticker']}**")
+        c3.markdown(f"<span style='color:#aaa;font-size:0.85em'>{r['name'][:22]}</span>",
+                    unsafe_allow_html=True)
+        c4.markdown(f"${r['price']:.2f}")
+        c5.markdown(
+            f"<span style='color:{'#00c853' if r['ret_20d']>=0 else '#d50000'}'>"
+            f"{r['ret_20d']:+.2f}%</span> &nbsp;"
+            f"<span style='color:#aaa;font-size:0.85em'>({r['gap']:+.2f}% vs ETF)</span>",
+            unsafe_allow_html=True,
+        )
+        c6.markdown(
+            f"<span style='color:{sig_color};font-weight:bold'>{r['signal']}</span>",
+            unsafe_allow_html=True,
+        )
+
+
 # ── Sector view ───────────────────────────────────────────────────────────────
-def show_sector(sector_data: dict, period: str):
+def show_sector(sector_data: dict, period: str, trading_mode: str = "Long-Term Investing"):
     name    = sector_data["name"]
     etf     = sector_data["etf"]
     tickers = sector_data["tickers"]
@@ -3103,11 +3521,11 @@ def show_sector(sector_data: dict, period: str):
     progress = st.progress(0, text="Loading sector stocks…")
     for i, t in enumerate(tickers):
         try:
-            hist, info = get_stock_data(t, period)
+            hist, info = get_stock_data(t, period, trading_mode=trading_mode)
             if hist.empty:
                 continue
             hist = calculate_indicators(hist)
-            _, overall, color, score = generate_signal(hist)
+            _, overall, color, score = generate_signal(hist, trading_mode=trading_mode)
             latest, prev = hist.iloc[-1], hist.iloc[-2]
             change_pct = (latest["Close"] - prev["Close"]) / prev["Close"] * 100
             mc = info.get("marketCap", 0)
@@ -3159,7 +3577,7 @@ def show_sector(sector_data: dict, period: str):
     st.subheader("🔍 Drill into a stock")
     pick = st.selectbox("Select a stock:", [r["Ticker"] for r in rows])
     if pick:
-        show_single_stock(pick, period)
+        show_single_stock(pick, period, trading_mode=trading_mode)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -3180,7 +3598,7 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
 st.sidebar.markdown("---")
 
 # Navigation mode
-nav_options = ["📈 Analyze", "📂 My Portfolio", "🤖 AI Chat"]
+nav_options = ["📈 Analyze", "🔍 Sector Scanner", "📂 My Portfolio", "🤖 AI Chat"]
 if urole == "admin":
     nav_options += ["👥 Users", "🔑 Change Password"]
 else:
@@ -3197,8 +3615,12 @@ default_q  = url_ticker if url_ticker else ""
 
 query  = st.sidebar.text_input("Stock, company, or sector", value=default_q,
                                 placeholder="e.g. Apple, TSLA, Technology, AI…",
-                                disabled=(nav_mode in ("📂 My Portfolio", "🤖 AI Chat")))
-period = st.sidebar.selectbox("Time Period", ["1mo","3mo","6mo","1y","2y","5y"], index=3)
+                                disabled=(nav_mode in ("📂 My Portfolio", "🤖 AI Chat", "🔍 Sector Scanner")))
+trading_mode = st.sidebar.selectbox("Trading Style", ["Day Trading", "Long-Term Investing"], index=1)
+mode_cfg = _mode_settings(trading_mode)
+period_options = mode_cfg["period_options"]
+default_period = mode_cfg["default_period"]
+period = st.sidebar.selectbox("Time Period", period_options, index=period_options.index(default_period))
 
 st.sidebar.markdown("---")
 st.sidebar.markdown("**Examples**")
@@ -3232,8 +3654,12 @@ if auto_refresh:
     st.sidebar.caption(f"Auto-refreshing every {interval_mins} min · refresh #{count}")
 
 # ── Route: non-analyze views ─────────────────────────────────────────────────
+if nav_mode == "🔍 Sector Scanner":
+    show_sector_laggard_scanner()
+    st.stop()
+
 if nav_mode == "📂 My Portfolio":
-    show_portfolio()
+    show_portfolio(trading_mode=trading_mode)
     st.stop()
 
 if nav_mode == "🤖 AI Chat":
@@ -3253,7 +3679,7 @@ if nav_mode == "🔑 Change Password":
 
 # ── Live ticker + Top 5 picks (Analyze mode only) ────────────────────────────
 render_ticker_bar()
-show_top_picks()
+show_top_picks(trading_mode=trading_mode)
 
 # ── Route input ───────────────────────────────────────────────────────────────
 if not query.strip():
@@ -3265,15 +3691,15 @@ is_dividend_q = resolve_dividend(query)
 is_portfolio_q = resolve_portfolio(query)
 
 if is_portfolio_q:
-    show_portfolio()
+    show_portfolio(trading_mode=trading_mode)
 elif is_dividend_q:
     show_dividend_stocks()
 elif sector_data:
-    show_sector(sector_data, period)
+    show_sector(sector_data, period, trading_mode=trading_mode)
 else:
     with st.spinner(f'Looking up "{query}"…'):
         ticker = search_ticker(query)
-    show_single_stock(ticker, period, resolved_from=query)
+    show_single_stock(ticker, period, resolved_from=query, trading_mode=trading_mode)
 
 # ── Comparison chart ──────────────────────────────────────────────────────────
 if not sector_data and not is_dividend_q and not is_portfolio_q and compare_input:
@@ -3284,7 +3710,7 @@ if not sector_data and not is_dividend_q and not is_portfolio_q and compare_inpu
     fig_c = go.Figure()
     for t in compare_tickers:
         try:
-            h, _ = get_stock_data(t, period)
+            h, _ = get_stock_data(t, period, trading_mode=trading_mode)
             if not h.empty:
                 norm = (h["Close"] / h["Close"].iloc[0]) * 100
                 fig_c.add_trace(go.Scatter(x=h.index, y=norm, name=t, mode="lines"))
