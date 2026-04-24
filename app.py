@@ -271,6 +271,41 @@ def _show_user_management():
     else:
         st.info("No other users to delete.")
 
+    # ── External API Keys ─────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🔑 Data Source API Keys")
+    st.caption("All sources are optional. More keys = richer signals from more agents.")
+    cfg = load_config()
+
+    key_fields = [
+        ("finnhub_api_key",    "Finnhub API Key",    "Get free key at finnhub.io",           "News, earnings, analyst ratings"),
+        ("fred_api_key",       "FRED API Key",       "Get free key at fred.stlouisfed.org",   "Macro: interest rates, inflation, GDP"),
+        ("polygon_api_key",    "Polygon.io API Key", "Get free key at polygon.io",            "Intraday data, real-time quotes"),
+        ("reddit_client_id",   "Reddit Client ID",   "Create app at reddit.com/prefs/apps",   "WSB/r/stocks sentiment"),
+        ("reddit_secret",      "Reddit Client Secret","Same Reddit app as above",             "WSB/r/stocks sentiment"),
+    ]
+    with st.form("external_keys_form"):
+        new_vals = {}
+        for key, label, help_txt, usage in key_fields:
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                new_vals[key] = st.text_input(label, value=cfg.get(key, ""),
+                                              type="password", help=f"{help_txt} · Used for: {usage}")
+            with col2:
+                st.caption(f"**{usage}**")
+        if st.form_submit_button("Save API Keys", type="primary"):
+            for k, v in new_vals.items():
+                if v.strip():
+                    cfg[k] = v.strip()
+            save_config(cfg)
+            st.success("API keys saved.")
+
+    active = [label for key, label, _, _ in key_fields if cfg.get(key)]
+    if active:
+        st.caption(f"Active sources: {', '.join(active)}")
+    else:
+        st.info("No external keys set — TradeRadar will use yfinance only.")
+
     # ── Claude API key ────────────────────────────────────────────────────────
     st.markdown("---")
     st.subheader("🤖 Claude AI Settings")
@@ -851,6 +886,383 @@ def _sector_momentum_score(ticker: str, info: dict, df: pd.DataFrame):
             return 0, f"In line with {sector} sector ({etf}), {diff:+.1f}% relative to sector"
     except Exception:
         return 0, "Sector momentum unavailable"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MULTI-AGENT ANALYSIS ENGINE
+# Each agent runs independently, returns (score, label, details_dict).
+# Consolidator weighs them and returns a unified verdict.
+# All external agents are optional — gracefully skipped if no API key.
+# ══════════════════════════════════════════════════════════════════════════════
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ── Agent 1: Technical Agent (yfinance) ───────────────────────────────────────
+def _agent_technical(ticker: str, df: pd.DataFrame) -> dict:
+    try:
+        if df is None or len(df) < 20:
+            return {"agent": "Technical", "score": 0, "verdict": "NEUTRAL", "details": "Insufficient data"}
+        close = df["Close"]
+        vol   = df["Volume"]
+        sma20 = close.rolling(20).mean().iloc[-1]
+        sma50 = close.rolling(50).mean().iloc[-1] if len(df) >= 50 else sma20
+        price = float(close.iloc[-1])
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean().iloc[-1]
+        loss  = (-delta.clip(upper=0)).rolling(14).mean().iloc[-1]
+        rsi   = 100 - (100 / (1 + gain / loss)) if loss != 0 else 50
+        ema12 = close.ewm(span=12).mean().iloc[-1]
+        ema26 = close.ewm(span=26).mean().iloc[-1]
+        macd  = ema12 - ema26
+        vol_avg = vol.rolling(20).mean().iloc[-1]
+        vol_now = float(vol.iloc[-1])
+
+        score = 0
+        notes = []
+        if price > float(sma20):   score += 1; notes.append("Above SMA20 ✓")
+        else:                       score -= 1; notes.append("Below SMA20 ✗")
+        if float(sma20) > float(sma50): score += 1; notes.append("SMA20 > SMA50 ✓")
+        else:                            score -= 1; notes.append("SMA20 < SMA50 ✗")
+        if rsi < 35:   score += 2; notes.append(f"RSI oversold {rsi:.0f} ✓")
+        elif rsi > 70: score -= 2; notes.append(f"RSI overbought {rsi:.0f} ✗")
+        else:          notes.append(f"RSI neutral {rsi:.0f}")
+        if macd > 0:   score += 1; notes.append("MACD bullish ✓")
+        else:          score -= 1; notes.append("MACD bearish ✗")
+        if vol_now > vol_avg * 1.5: score += 1; notes.append("Volume surge ✓")
+
+        verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
+        return {"agent": "Technical", "score": score, "verdict": verdict,
+                "details": " · ".join(notes), "weight": 1.5}
+    except Exception as e:
+        return {"agent": "Technical", "score": 0, "verdict": "NEUTRAL", "details": str(e), "weight": 1.5}
+
+
+# ── Agent 2: Fundamentals Agent (yfinance + SEC EDGAR) ────────────────────────
+def _agent_fundamentals(ticker: str, info: dict) -> dict:
+    try:
+        score = 0
+        notes = []
+        if not info:
+            return {"agent": "Fundamentals", "score": 0, "verdict": "NEUTRAL",
+                    "details": "No fundamental data", "weight": 1.2}
+
+        pe  = info.get("trailingPE") or info.get("forwardPE")
+        peg = info.get("pegRatio")
+        roe = (info.get("returnOnEquity") or 0) * 100
+        de  = (info.get("debtToEquity") or 0)
+        eg  = (info.get("earningsGrowth") or info.get("revenueGrowth") or 0) * 100
+        fcf = info.get("freeCashflow") or 0
+        mc  = info.get("marketCap") or 1
+
+        if pe and pe < 15:   score += 1; notes.append(f"P/E low {pe:.1f} ✓")
+        elif pe and pe > 40: score -= 1; notes.append(f"P/E high {pe:.1f} ✗")
+        if peg and peg < 1:  score += 2; notes.append(f"PEG undervalued {peg:.2f} ✓")
+        elif peg and peg > 2.5: score -= 1; notes.append(f"PEG stretched {peg:.2f} ✗")
+        if roe > 20:  score += 1; notes.append(f"ROE strong {roe:.1f}% ✓")
+        if de < 50:   score += 1; notes.append(f"Low debt ✓")
+        elif de > 200: score -= 1; notes.append(f"High debt {de:.0f}% ✗")
+        if eg > 15:   score += 1; notes.append(f"Growth {eg:.1f}% ✓")
+        elif eg < -10: score -= 1; notes.append(f"Declining growth {eg:.1f}% ✗")
+        if fcf > 0 and (fcf / mc) > 0.03: score += 1; notes.append("Strong FCF yield ✓")
+
+        # SEC EDGAR insider data via yfinance
+        try:
+            stock   = yf.Ticker(ticker)
+            insider = stock.insider_transactions
+            if insider is not None and not insider.empty:
+                buys  = insider[insider.get("Transaction", insider.get("transaction","")).str.contains("Buy|Purchase", case=False, na=False)]
+                sells = insider[insider.get("Transaction", insider.get("transaction","")).str.contains("Sale|Sell", case=False, na=False)]
+                if len(buys) >= 2: score += 1; notes.append(f"Insiders buying ({len(buys)} txns) ✓")
+                elif len(sells) > len(buys) + 2: score -= 1; notes.append(f"Insiders selling ✗")
+        except Exception:
+            pass
+
+        verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
+        return {"agent": "Fundamentals", "score": score, "verdict": verdict,
+                "details": " · ".join(notes) or "No signals", "weight": 1.2}
+    except Exception as e:
+        return {"agent": "Fundamentals", "score": 0, "verdict": "NEUTRAL", "details": str(e), "weight": 1.2}
+
+
+# ── Agent 3: Sentiment Agent (Finnhub + Reddit + yfinance news) ───────────────
+def _agent_sentiment(ticker: str) -> dict:
+    score = 0
+    notes = []
+    cfg   = load_config()
+
+    # Finnhub news sentiment
+    finnhub_key = cfg.get("finnhub_api_key", "")
+    if finnhub_key:
+        try:
+            import urllib.request, datetime
+            end   = datetime.date.today().isoformat()
+            start = (datetime.date.today() - datetime.timedelta(days=7)).isoformat()
+            url   = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={start}&to={end}&token={finnhub_key}"
+            with urllib.request.urlopen(url, timeout=5) as r:
+                articles = json.loads(r.read())
+            pos = sum(1 for a in articles if any(w in a.get("headline","").lower()
+                      for w in ["beat","surge","growth","upgrade","record","strong"]))
+            neg = sum(1 for a in articles if any(w in a.get("headline","").lower()
+                      for w in ["miss","decline","downgrade","lawsuit","recall","loss"]))
+            if pos > neg + 2:   score += 2; notes.append(f"Finnhub: {pos} positive headlines ✓")
+            elif neg > pos + 2: score -= 2; notes.append(f"Finnhub: {neg} negative headlines ✗")
+            else:                notes.append(f"Finnhub: mixed news ({pos}+ {neg}-)")
+
+            # Analyst recommendations from Finnhub
+            url2 = f"https://finnhub.io/api/v1/stock/recommendation?symbol={ticker}&token={finnhub_key}"
+            with urllib.request.urlopen(url2, timeout=5) as r2:
+                recs = json.loads(r2.read())
+            if recs:
+                latest = recs[0]
+                strong_buy = latest.get("strongBuy", 0)
+                buy        = latest.get("buy", 0)
+                sell       = latest.get("sell", 0) + latest.get("strongSell", 0)
+                if strong_buy + buy > sell * 2: score += 1; notes.append(f"Analysts bullish ({strong_buy+buy} buy vs {sell} sell) ✓")
+                elif sell > strong_buy + buy:   score -= 1; notes.append(f"Analysts bearish ({sell} sell) ✗")
+        except Exception as e:
+            notes.append(f"Finnhub unavailable")
+
+    # Reddit WSB/stocks sentiment
+    reddit_id     = cfg.get("reddit_client_id", "")
+    reddit_secret = cfg.get("reddit_secret", "")
+    if reddit_id and reddit_secret:
+        try:
+            import urllib.request, urllib.parse, base64
+            auth = base64.b64encode(f"{reddit_id}:{reddit_secret}".encode()).decode()
+            tok_req = urllib.request.Request(
+                "https://www.reddit.com/api/v1/access_token",
+                data=urllib.parse.urlencode({"grant_type": "client_credentials"}).encode(),
+                headers={"Authorization": f"Basic {auth}", "User-Agent": "TradeRadar/1.0"}
+            )
+            tok_req.get_method = lambda: "POST"
+            with urllib.request.urlopen(tok_req, timeout=5) as tr:
+                token = json.loads(tr.read()).get("access_token", "")
+            if token:
+                search_req = urllib.request.Request(
+                    f"https://oauth.reddit.com/r/wallstreetbets+stocks/search?q={ticker}&sort=new&limit=25&t=week",
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": "TradeRadar/1.0"}
+                )
+                with urllib.request.urlopen(search_req, timeout=5) as sr:
+                    posts = json.loads(sr.read()).get("data", {}).get("children", [])
+                bull = sum(1 for p in posts if any(w in p["data"].get("title","").lower()
+                           for w in ["bullish","buy","calls","moon","🚀","long"]))
+                bear = sum(1 for p in posts if any(w in p["data"].get("title","").lower()
+                           for w in ["bearish","puts","short","crash","dump","🌈🐻"]))
+                if bull > bear + 3:   score += 1; notes.append(f"Reddit bullish ({bull} posts) ✓")
+                elif bear > bull + 3: score -= 1; notes.append(f"Reddit bearish ({bear} posts) ✗")
+                else:                  notes.append(f"Reddit neutral")
+        except Exception:
+            notes.append("Reddit unavailable")
+
+    # Fallback: yfinance news
+    if not finnhub_key:
+        try:
+            news = yf.Ticker(ticker).news or []
+            pos = neg = 0
+            for n in news[:10]:
+                t = n.get("content", {}).get("title", "").lower()
+                if any(w in t for w in ["beat","surge","growth","upgrade","strong"]): pos += 1
+                if any(w in t for w in ["miss","decline","downgrade","lawsuit","loss"]): neg += 1
+            if pos > neg + 1:   score += 1; notes.append(f"News positive ({pos} articles) ✓")
+            elif neg > pos + 1: score -= 1; notes.append(f"News negative ({neg} articles) ✗")
+            else:                notes.append("News mixed")
+        except Exception:
+            pass
+
+    verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
+    return {"agent": "Sentiment", "score": score, "verdict": verdict,
+            "details": " · ".join(notes) or "No sentiment data", "weight": 1.0}
+
+
+# ── Agent 4: Macro Agent (FRED + VIX) ─────────────────────────────────────────
+def _agent_macro() -> dict:
+    score = 0
+    notes = []
+    cfg   = load_config()
+    fred_key = cfg.get("fred_api_key", "")
+
+    if fred_key:
+        try:
+            import urllib.request
+            def fred(series):
+                url = f"https://api.stlouisfed.org/fred/series/observations?series_id={series}&sort_order=desc&limit=2&api_key={fred_key}&file_type=json"
+                with urllib.request.urlopen(url, timeout=5) as r:
+                    obs = json.loads(r.read())["observations"]
+                return [float(o["value"]) for o in obs if o["value"] != "."]
+
+            # Fed Funds Rate trend
+            ff = fred("FEDFUNDS")
+            if len(ff) >= 2:
+                if ff[0] < ff[1]:   score += 1; notes.append(f"Fed cutting rates ({ff[0]:.2f}%) ✓")
+                elif ff[0] > ff[1]: score -= 1; notes.append(f"Fed hiking rates ({ff[0]:.2f}%) ✗")
+                else:                notes.append(f"Fed rates stable ({ff[0]:.2f}%)")
+
+            # Inflation (CPI)
+            cpi = fred("CPIAUCSL")
+            if len(cpi) >= 2:
+                cpi_chg = (cpi[0] - cpi[1]) / cpi[1] * 100 * 12
+                if cpi_chg < 2.5:   score += 1; notes.append(f"Inflation cooling {cpi_chg:.1f}% ✓")
+                elif cpi_chg > 4.0: score -= 1; notes.append(f"Inflation hot {cpi_chg:.1f}% ✗")
+                else:                notes.append(f"Inflation moderate {cpi_chg:.1f}%")
+
+            # Unemployment
+            ue = fred("UNRATE")
+            if ue:
+                if ue[0] < 4.5:   score += 1; notes.append(f"Unemployment low {ue[0]:.1f}% ✓")
+                elif ue[0] > 6.0: score -= 1; notes.append(f"Unemployment high {ue[0]:.1f}% ✗")
+
+        except Exception:
+            notes.append("FRED unavailable")
+
+    # Always check VIX (free via yfinance)
+    try:
+        vix_hist = yf.download("^VIX", period="5d", progress=False, auto_adjust=True)
+        if not vix_hist.empty:
+            vix = float(vix_hist["Close"].iloc[-1])
+            if vix < 15:   score += 1; notes.append(f"VIX low {vix:.1f} (calm market) ✓")
+            elif vix > 30: score -= 2; notes.append(f"VIX high {vix:.1f} (fear elevated) ✗")
+            elif vix > 20: score -= 1; notes.append(f"VIX elevated {vix:.1f}")
+            else:           notes.append(f"VIX normal {vix:.1f}")
+    except Exception:
+        notes.append("VIX unavailable")
+
+    # SPY trend
+    try:
+        spy = yf.download("SPY", period="3mo", progress=False, auto_adjust=True)
+        if not spy.empty and len(spy) >= 50:
+            sma20 = spy["Close"].rolling(20).mean().iloc[-1]
+            sma50 = spy["Close"].rolling(50).mean().iloc[-1]
+            if float(sma20) > float(sma50): score += 1; notes.append("SPY uptrend ✓")
+            else:                            score -= 1; notes.append("SPY downtrend ✗")
+    except Exception:
+        pass
+
+    verdict = "BULLISH" if score >= 2 else "BEARISH" if score <= -2 else "NEUTRAL"
+    return {"agent": "Macro", "score": score, "verdict": verdict,
+            "details": " · ".join(notes) or "No macro data", "weight": 0.8}
+
+
+# ── Agent 5: Options Flow Agent (yfinance) ────────────────────────────────────
+def _agent_options_flow(ticker: str, price: float) -> dict:
+    try:
+        stock   = yf.Ticker(ticker)
+        expiries = stock.options
+        if not expiries:
+            return {"agent": "Options Flow", "score": 0, "verdict": "NEUTRAL",
+                    "details": "No options data", "weight": 0.7}
+        chain  = stock.option_chain(expiries[0])
+        calls_vol = chain.calls["volume"].fillna(0).sum()
+        puts_vol  = chain.puts["volume"].fillna(0)
+        puts_total = puts_vol.sum()
+        pc_ratio  = puts_total / calls_vol if calls_vol > 0 else 1.0
+
+        # Unusual options activity
+        calls_oi  = chain.calls["openInterest"].fillna(0).sum()
+        puts_oi   = chain.puts["openInterest"].fillna(0).sum()
+        itm_calls = chain.calls[chain.calls["strike"] < price]["volume"].fillna(0).sum()
+
+        score = 0
+        notes = []
+        if pc_ratio < 0.5:   score += 2; notes.append(f"P/C ratio {pc_ratio:.2f} (heavy call buying) ✓")
+        elif pc_ratio < 0.7: score += 1; notes.append(f"P/C ratio {pc_ratio:.2f} (call bias) ✓")
+        elif pc_ratio > 1.5: score -= 2; notes.append(f"P/C ratio {pc_ratio:.2f} (heavy put buying) ✗")
+        elif pc_ratio > 1.2: score -= 1; notes.append(f"P/C ratio {pc_ratio:.2f} (put bias) ✗")
+        else:                 notes.append(f"P/C ratio neutral {pc_ratio:.2f}")
+
+        if calls_oi > puts_oi * 1.5: score += 1; notes.append("More call open interest ✓")
+        elif puts_oi > calls_oi * 1.5: score -= 1; notes.append("More put open interest ✗")
+
+        verdict = "BULLISH" if score >= 1 else "BEARISH" if score <= -1 else "NEUTRAL"
+        return {"agent": "Options Flow", "score": score, "verdict": verdict,
+                "details": " · ".join(notes), "weight": 0.7}
+    except Exception as e:
+        return {"agent": "Options Flow", "score": 0, "verdict": "NEUTRAL",
+                "details": "Options data unavailable", "weight": 0.7}
+
+
+# ── Consolidator ──────────────────────────────────────────────────────────────
+def run_multi_agent_analysis(ticker: str, df: pd.DataFrame, info: dict = None) -> dict:
+    """
+    Run all agents in parallel, consolidate into a single verdict.
+    Returns dict with overall score, verdict, and per-agent breakdown.
+    """
+    price = float(df["Close"].iloc[-1]) if df is not None and not df.empty else 0
+
+    tasks = {
+        "technical":    lambda: _agent_technical(ticker, df),
+        "fundamentals": lambda: _agent_fundamentals(ticker, info),
+        "sentiment":    lambda: _agent_sentiment(ticker),
+        "macro":        lambda: _agent_macro(),
+        "options":      lambda: _agent_options_flow(ticker, price),
+    }
+
+    results = {}
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {ex.submit(fn): name for name, fn in tasks.items()}
+        for future in as_completed(futures):
+            name = futures[future]
+            try:
+                results[name] = future.result()
+            except Exception as e:
+                results[name] = {"agent": name, "score": 0, "verdict": "NEUTRAL",
+                                 "details": str(e), "weight": 1.0}
+
+    # Weighted consolidation
+    total_weight = sum(r.get("weight", 1.0) for r in results.values())
+    weighted_score = sum(r["score"] * r.get("weight", 1.0) for r in results.values())
+    final_score = weighted_score / total_weight if total_weight else 0
+
+    bullish = sum(1 for r in results.values() if r["verdict"] == "BULLISH")
+    bearish = sum(1 for r in results.values() if r["verdict"] == "BEARISH")
+
+    if final_score >= 1.5:   verdict, color = "STRONG BUY",  "#00e676"
+    elif final_score >= 0.5: verdict, color = "BUY",         "#69f0ae"
+    elif final_score >= -0.5:verdict, color = "HOLD",        "#ffd740"
+    elif final_score >= -1.5:verdict, color = "SELL",        "#ff6d00"
+    else:                     verdict, color = "STRONG SELL", "#ff1744"
+
+    return {
+        "verdict":      verdict,
+        "color":        color,
+        "final_score":  round(final_score, 2),
+        "bullish_count": bullish,
+        "bearish_count": bearish,
+        "agents":       list(results.values()),
+    }
+
+
+def show_multi_agent_panel(ticker: str, df: pd.DataFrame, info: dict = None):
+    """Render the multi-agent analysis panel in the UI."""
+    with st.spinner("Running multi-agent analysis..."):
+        result = run_multi_agent_analysis(ticker, df, info)
+
+    verdict = result["verdict"]
+    color   = result["color"]
+    score   = result["final_score"]
+    bull    = result["bullish_count"]
+    bear    = result["bearish_count"]
+    neutral = len(result["agents"]) - bull - bear
+
+    st.markdown(f"""
+<div style="background:#111;border:2px solid {color};border-radius:12px;padding:16px;margin:12px 0;">
+  <div style="font-size:1.6em;font-weight:bold;color:{color};text-align:center;">{verdict}</div>
+  <div style="text-align:center;color:#aaa;margin-top:4px;">
+    Consolidated score: <b style="color:#fff;">{score:+.2f}</b> &nbsp;|&nbsp;
+    🟢 {bull} Bullish &nbsp; 🔴 {bear} Bearish &nbsp; ⚪ {neutral} Neutral
+  </div>
+</div>
+""", unsafe_allow_html=True)
+
+    with st.expander("🔍 Agent Breakdown", expanded=False):
+        agent_colors = {"BULLISH": "#00e676", "BEARISH": "#ff5252", "NEUTRAL": "#ffd740"}
+        for agent in result["agents"]:
+            ac = agent_colors.get(agent["verdict"], "#aaa")
+            st.markdown(f"""
+<div style="border-left:4px solid {ac};padding:8px 12px;margin:6px 0;background:#1a1a1a;border-radius:4px;">
+  <span style="color:{ac};font-weight:bold;">{agent['agent']}</span>
+  <span style="color:#aaa;font-size:0.85em;margin-left:8px;">{agent['verdict']} · score {agent['score']:+d}</span><br>
+  <span style="color:#ccc;font-size:0.82em;">{agent['details']}</span>
+</div>
+""", unsafe_allow_html=True)
 
 
 def generate_signal(df: pd.DataFrame, info: dict = None, ticker: str = ""):
@@ -2439,6 +2851,10 @@ def show_single_stock(ticker: str, period: str, resolved_from: str = ""):
     c4.metric("P/E Ratio",  f"{pe:.1f}" if isinstance(pe, float) else "N/A")
     c5.metric("52W Low",   f"${info.get('fiftyTwoWeekLow',0):.2f}"  if info.get('fiftyTwoWeekLow')  else "N/A")
     c6.metric("52W High",  f"${info.get('fiftyTwoWeekHigh',0):.2f}" if info.get('fiftyTwoWeekHigh') else "N/A")
+
+    # ── Multi-Agent Analysis Panel ───────────────────────────────────────────
+    st.markdown("### 🤖 Multi-Agent Analysis")
+    show_multi_agent_panel(ticker, hist, info)
 
     st.markdown("---")
 
