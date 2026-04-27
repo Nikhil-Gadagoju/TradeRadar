@@ -3597,25 +3597,22 @@ if st.sidebar.button("🚪 Logout", use_container_width=True):
     st.rerun()
 st.sidebar.markdown("---")
 
-# Navigation mode
-nav_options = ["📈 Analyze", "🔍 Sector Scanner", "📂 My Portfolio", "🤖 AI Chat"]
+# Sidebar-only links (admin / utility pages)
+sidebar_nav_options = ["🤖 AI Chat", "🔑 Change Password"]
 if urole == "admin":
-    nav_options += ["👥 Users", "🔑 Change Password"]
-else:
-    nav_options += ["🔑 Change Password"]
+    sidebar_nav_options = ["👥 Users"] + sidebar_nav_options
 
-nav_mode = st.sidebar.radio(
-    "View",
-    nav_options,
-    horizontal=True,
-)
+sidebar_page = st.sidebar.radio("Pages", ["—"] + sidebar_nav_options, label_visibility="collapsed")
 
+# Controls that apply to the Analyze tab
 url_ticker = st.query_params.get("ticker", "")
 default_q  = url_ticker if url_ticker else ""
 
-query  = st.sidebar.text_input("Stock, company, or sector", value=default_q,
-                                placeholder="e.g. Apple, TSLA, Technology, AI…",
-                                disabled=(nav_mode in ("📂 My Portfolio", "🤖 AI Chat", "🔍 Sector Scanner")))
+query = st.sidebar.text_input(
+    "Stock, company, or sector",
+    value=default_q,
+    placeholder="e.g. Apple, TSLA, Technology, AI…",
+)
 trading_mode = st.sidebar.selectbox("Trading Style", ["Day Trading", "Long-Term Investing"], index=1)
 mode_cfg = _mode_settings(trading_mode)
 period_options = mode_cfg["period_options"]
@@ -3653,72 +3650,76 @@ if auto_refresh:
     count = st_autorefresh(interval=interval_mins * 60 * 1000, key="autorefresh")
     st.sidebar.caption(f"Auto-refreshing every {interval_mins} min · refresh #{count}")
 
-# ── Route: non-analyze views ─────────────────────────────────────────────────
-if nav_mode == "🔍 Sector Scanner":
-    show_sector_laggard_scanner()
-    st.stop()
-
-if nav_mode == "📂 My Portfolio":
-    show_portfolio(trading_mode=trading_mode)
-    st.stop()
-
-if nav_mode == "🤖 AI Chat":
+# ── Sidebar-only page routes ──────────────────────────────────────────────────
+if sidebar_page == "🤖 AI Chat":
     show_ai_chat_page()
     st.stop()
 
-if nav_mode == "👥 Users":
+if sidebar_page == "👥 Users":
     if urole == "admin":
         _show_user_management()
     else:
         st.error("Admin access required.")
     st.stop()
 
-if nav_mode == "🔑 Change Password":
+if sidebar_page == "🔑 Change Password":
     _show_change_password()
     st.stop()
 
-# ── Live ticker + Top 5 picks (Analyze mode only) ────────────────────────────
-render_ticker_bar()
-show_top_picks(trading_mode=trading_mode)
+# ── Main three-tab layout ─────────────────────────────────────────────────────
+tab_analyze, tab_portfolio, tab_scanner = st.tabs(
+    ["📈 Analyze", "📂 My Portfolio", "🔍 Sector Scanner"]
+)
 
-# ── Route input ───────────────────────────────────────────────────────────────
-if not query.strip():
-    st.info("Enter a stock, company name, or sector in the sidebar.")
-    st.stop()
+# ── Tab: Analyze ──────────────────────────────────────────────────────────────
+with tab_analyze:
+    render_ticker_bar()
+    show_top_picks(trading_mode=trading_mode)
 
-sector_data   = resolve_sector(query)
-is_dividend_q = resolve_dividend(query)
-is_portfolio_q = resolve_portfolio(query)
+    if not query.strip():
+        st.info("Enter a stock, company name, or sector in the sidebar.")
+    else:
+        sector_data    = resolve_sector(query)
+        is_dividend_q  = resolve_dividend(query)
+        is_portfolio_q = resolve_portfolio(query)
 
-if is_portfolio_q:
+        if is_portfolio_q:
+            show_portfolio(trading_mode=trading_mode)
+        elif is_dividend_q:
+            show_dividend_stocks()
+        elif sector_data:
+            show_sector(sector_data, period, trading_mode=trading_mode)
+        else:
+            with st.spinner(f'Looking up "{query}"…'):
+                ticker = search_ticker(query)
+            show_single_stock(ticker, period, resolved_from=query, trading_mode=trading_mode)
+
+        # Comparison chart
+        if not sector_data and not is_dividend_q and not is_portfolio_q and compare_input:
+            st.markdown("---")
+            st.subheader("📊 Comparison Chart")
+            resolved_main   = search_ticker(query)
+            compare_tickers = [resolved_main] + [t.strip().upper() for t in compare_input.split(",") if t.strip()]
+            fig_c = go.Figure()
+            for t in compare_tickers:
+                try:
+                    h, _ = get_stock_data(t, period, trading_mode=trading_mode)
+                    if not h.empty:
+                        norm = (h["Close"] / h["Close"].iloc[0]) * 100
+                        fig_c.add_trace(go.Scatter(x=h.index, y=norm, name=t, mode="lines"))
+                except Exception:
+                    st.warning(f"Could not load {t}")
+            fig_c.update_layout(title="Normalized Price Performance (base = 100)", template="plotly_dark",
+                                yaxis_title="% Return", height=400)
+            st.plotly_chart(fig_c, use_container_width=True)
+
+# ── Tab: Portfolio ────────────────────────────────────────────────────────────
+with tab_portfolio:
     show_portfolio(trading_mode=trading_mode)
-elif is_dividend_q:
-    show_dividend_stocks()
-elif sector_data:
-    show_sector(sector_data, period, trading_mode=trading_mode)
-else:
-    with st.spinner(f'Looking up "{query}"…'):
-        ticker = search_ticker(query)
-    show_single_stock(ticker, period, resolved_from=query, trading_mode=trading_mode)
 
-# ── Comparison chart ──────────────────────────────────────────────────────────
-if not sector_data and not is_dividend_q and not is_portfolio_q and compare_input:
-    st.markdown("---")
-    st.subheader("📊 Comparison Chart")
-    resolved_main   = search_ticker(query)
-    compare_tickers = [resolved_main] + [t.strip().upper() for t in compare_input.split(",") if t.strip()]
-    fig_c = go.Figure()
-    for t in compare_tickers:
-        try:
-            h, _ = get_stock_data(t, period, trading_mode=trading_mode)
-            if not h.empty:
-                norm = (h["Close"] / h["Close"].iloc[0]) * 100
-                fig_c.add_trace(go.Scatter(x=h.index, y=norm, name=t, mode="lines"))
-        except Exception:
-            st.warning(f"Could not load {t}")
-    fig_c.update_layout(title="Normalized Price Performance (base = 100)", template="plotly_dark",
-                        yaxis_title="% Return", height=400)
-    st.plotly_chart(fig_c, use_container_width=True)
+# ── Tab: Sector Scanner ───────────────────────────────────────────────────────
+with tab_scanner:
+    show_sector_laggard_scanner()
 
 st.markdown("---")
 st.caption("Data from Yahoo Finance · refreshed every 5 min · not financial advice.")
