@@ -3613,7 +3613,7 @@ query = st.sidebar.text_input(
     value=default_q,
     placeholder="e.g. Apple, TSLA, Technology, AI…",
 )
-trading_mode = st.sidebar.selectbox("Trading Style", ["Day Trading", "Long-Term Investing"], index=1)
+trading_mode = st.sidebar.selectbox("Trading Style", ["Day Trading", "Long-Term Investing"], index=0)
 mode_cfg = _mode_settings(trading_mode)
 period_options = mode_cfg["period_options"]
 default_period = mode_cfg["default_period"]
