@@ -3580,6 +3580,234 @@ def show_sector(sector_data: dict, period: str, trading_mode: str = "Long-Term I
         show_single_stock(pick, period, trading_mode=trading_mode)
 
 
+# ── Morning Scanner ──────────────────────────────────────────────────────────
+_MORNING_WATCHLIST = [
+    "NVDA", "AAPL", "MSFT", "TSLA", "AMD", "META", "GOOGL", "AMZN",
+    "SPY",  "QQQ",  "JPM",  "V",    "NFLX","UBER", "COIN",  "PLTR",
+    "ARM",  "SMCI", "MU",   "AVGO",
+]
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _scan_morning_pick(ticker: str) -> dict | None:
+    try:
+        df = yf.download(ticker, period="5d", interval="5m",
+                         progress=False, auto_adjust=True)
+        if df.empty or len(df) < 40:
+            return None
+
+        close  = df["Close"].squeeze()
+        volume = df["Volume"].squeeze()
+
+        # Separate yesterday vs today by date
+        today = close.index[-1].date()
+        today_mask = df.index.date == today
+        yest_mask  = df.index.date != today
+
+        if not today_mask.any() or not yest_mask.any():
+            return None
+
+        prev_close = float(close[yest_mask].iloc[-1])
+        today_open = float(close[today_mask].iloc[0])
+        curr_price = float(close.iloc[-1])
+        gap_pct    = (today_open - prev_close) / prev_close * 100
+
+        # ATR from all data
+        df = calculate_indicators(df)
+        atr = float(df["ATR"].iloc[-1])
+        if atr == 0 or np.isnan(atr):
+            return None
+
+        rsi   = float(df["RSI"].iloc[-1]) if not np.isnan(df["RSI"].iloc[-1]) else 50
+        macd_h = float(df["MACD_Hist"].iloc[-1])
+        macd_h_p = float(df["MACD_Hist"].iloc[-2])
+        ema9   = float(df["EMA_9"].iloc[-1])
+        ema21  = float(df["EMA_21"].iloc[-1])
+
+        # Volume surge vs prior 20 bars
+        vol_now = float(volume[today_mask].sum())
+        vol_avg = float(volume[yest_mask].rolling(20).mean().iloc[-1])
+        vol_ratio = vol_now / vol_avg if vol_avg > 0 else 1.0
+
+        # Score: gap direction + momentum indicators
+        score = 0
+        if gap_pct > 1.0:   score += 2
+        elif gap_pct > 0:   score += 1
+        elif gap_pct < -1.0: score -= 2
+        else:               score -= 1
+
+        if rsi < 35:        score += 2
+        elif rsi < 45:      score += 1
+        elif rsi > 65:      score -= 1
+        elif rsi > 75:      score -= 2
+
+        if macd_h > 0 and macd_h > macd_h_p: score += 2
+        elif macd_h > macd_h_p:              score += 1
+        elif macd_h < macd_h_p:              score -= 1
+
+        if ema9 > ema21:    score += 1
+        else:               score -= 1
+
+        if vol_ratio > 1.5: score += 1 if score >= 0 else -1
+
+        if score >= 4:      signal, direction = "STRONG BUY",  "long"
+        elif score >= 2:    signal, direction = "BUY",         "long"
+        elif score <= -4:   signal, direction = "STRONG SELL", "short"
+        elif score <= -2:   signal, direction = "SELL",        "short"
+        else:               signal, direction = "HOLD",        "neutral"
+
+        if direction == "long":
+            entry      = round(curr_price, 2)
+            stop_loss  = round(curr_price - 1.0 * atr, 2)
+            target1    = round(curr_price + 1.5 * atr, 2)
+            target2    = round(curr_price + 2.5 * atr, 2)
+        elif direction == "short":
+            entry      = round(curr_price, 2)
+            stop_loss  = round(curr_price + 1.0 * atr, 2)
+            target1    = round(curr_price - 1.5 * atr, 2)
+            target2    = round(curr_price - 2.5 * atr, 2)
+        else:
+            entry = stop_loss = target1 = target2 = curr_price
+
+        risk   = abs(entry - stop_loss)
+        reward = abs(target1 - entry)
+        rr     = round(reward / risk, 1) if risk > 0 else 0
+
+        t1_pct = (target1 - curr_price) / curr_price * 100
+        t2_pct = (target2 - curr_price) / curr_price * 100
+        sl_pct = (stop_loss - curr_price) / curr_price * 100
+
+        return {
+            "ticker":    ticker,
+            "price":     curr_price,
+            "gap_pct":   round(gap_pct, 2),
+            "vol_ratio": round(vol_ratio, 1),
+            "rsi":       round(rsi, 1),
+            "signal":    signal,
+            "direction": direction,
+            "score":     score,
+            "entry":     entry,
+            "stop_loss": stop_loss,
+            "target1":   target1,
+            "target2":   target2,
+            "t1_pct":    round(t1_pct, 2),
+            "t2_pct":    round(t2_pct, 2),
+            "sl_pct":    round(sl_pct, 2),
+            "rr":        rr,
+        }
+    except Exception:
+        return None
+
+
+def show_morning_scanner():
+    st.markdown("### ⏰ Opening Bell Scanner")
+    st.caption("Best momentum setups for the first 15–30 minutes of the trading day.")
+
+    col_wl, col_refresh = st.columns([4, 1])
+    with col_wl:
+        custom_raw = st.text_input(
+            "Watchlist (comma-separated)",
+            value=", ".join(_MORNING_WATCHLIST),
+            key="morning_wl",
+        )
+    with col_refresh:
+        st.markdown("<br>", unsafe_allow_html=True)
+        force_refresh = st.button("🔄 Refresh", key="morning_refresh", use_container_width=True)
+
+    if force_refresh:
+        st.cache_data.clear()
+
+    watchlist = [t.strip().upper() for t in custom_raw.split(",") if t.strip()]
+
+    with st.spinner("Scanning for opening setups…"):
+        results = []
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(_scan_morning_pick, t): t for t in watchlist}
+            for fut in as_completed(futs):
+                r = fut.result()
+                if r:
+                    results.append(r)
+
+    if not results:
+        st.warning("No data returned — market may not be open yet or network issue.")
+        return
+
+    # Sort: actionable signals first, then by abs score desc
+    def _sort_key(r):
+        order = {"STRONG BUY": 0, "STRONG SELL": 1, "BUY": 2, "SELL": 3, "HOLD": 4}
+        return (order.get(r["signal"], 5), -abs(r["score"]))
+
+    results.sort(key=_sort_key)
+    actionable = [r for r in results if r["signal"] != "HOLD"]
+
+    # Summary row
+    buys  = sum(1 for r in results if "BUY"  in r["signal"])
+    sells = sum(1 for r in results if "SELL" in r["signal"])
+    holds = sum(1 for r in results if r["signal"] == "HOLD")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("🟢 Long setups",  buys)
+    m2.metric("🔴 Short setups", sells)
+    m3.metric("⏸️ No setup",     holds)
+    m4.metric("Scanned",        len(results))
+
+    st.markdown("---")
+
+    # ── Cards for actionable picks ────────────────────────────────────────────
+    if actionable:
+        st.markdown("#### Top Setups")
+        cols_per_row = 3
+        for i in range(0, len(actionable), cols_per_row):
+            chunk = actionable[i:i + cols_per_row]
+            cols  = st.columns(cols_per_row)
+            for col, r in zip(cols, chunk):
+                is_long  = r["direction"] == "long"
+                sig_color = "#00c853" if is_long else "#d50000"
+                border    = "#00c853" if is_long else "#d50000"
+                t1_label  = "🎯 Exit T1" if is_long else "🎯 Cover T1"
+                t2_label  = "🎯 Exit T2" if is_long else "🎯 Cover T2"
+                col.markdown(
+                    f"""
+<div style="border:1px solid {border};border-radius:8px;padding:12px;margin-bottom:8px">
+  <b style="font-size:1.1em">{r['ticker']}</b>
+  &nbsp;<span style="color:{sig_color};font-weight:bold">{r['signal']}</span><br>
+  <span style="color:#aaa;font-size:0.85em">Gap {r['gap_pct']:+.2f}% &nbsp;|&nbsp; {r['vol_ratio']}x vol &nbsp;|&nbsp; RSI {r['rsi']}</span>
+  <hr style="margin:6px 0;border-color:#333">
+  <table style="width:100%;font-size:0.9em">
+    <tr><td>💲 Price</td><td><b>${r['price']:.2f}</b></td></tr>
+    <tr><td>📍 Entry</td><td><b>${r['entry']:.2f}</b></td></tr>
+    <tr><td>{t1_label}</td><td><b>${r['target1']:.2f}</b> <span style="color:#aaa">({r['t1_pct']:+.1f}%)</span></td></tr>
+    <tr><td>{t2_label}</td><td><b>${r['target2']:.2f}</b> <span style="color:#aaa">({r['t2_pct']:+.1f}%)</span></td></tr>
+    <tr><td>🛑 Stop</td><td><b>${r['stop_loss']:.2f}</b> <span style="color:#d50000">({r['sl_pct']:+.1f}%)</span></td></tr>
+    <tr><td>⚖️ R/R</td><td><b>1 : {r['rr']}</b></td></tr>
+  </table>
+</div>
+""",
+                    unsafe_allow_html=True,
+                )
+    else:
+        st.info("No strong setups detected right now. Check back after market open.")
+
+    # ── Full table ────────────────────────────────────────────────────────────
+    with st.expander("📋 Full scan table", expanded=False):
+        table_rows = []
+        for r in results:
+            sig_icon = "🟢" if "BUY" in r["signal"] else ("🔴" if "SELL" in r["signal"] else "⏸️")
+            table_rows.append({
+                "Ticker":    r["ticker"],
+                "Signal":    f"{sig_icon} {r['signal']}",
+                "Price":     f"${r['price']:.2f}",
+                "Gap %":     f"{r['gap_pct']:+.2f}%",
+                "Entry":     f"${r['entry']:.2f}",
+                "Exit T1":   f"${r['target1']:.2f} ({r['t1_pct']:+.1f}%)",
+                "Exit T2":   f"${r['target2']:.2f} ({r['t2_pct']:+.1f}%)",
+                "Stop":      f"${r['stop_loss']:.2f} ({r['sl_pct']:+.1f}%)",
+                "R/R":       f"1 : {r['rr']}",
+                "Vol Ratio": f"{r['vol_ratio']}x",
+                "RSI":       r["rsi"],
+                "Score":     r["score"],
+            })
+        st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.header("Settings")
 
@@ -3666,10 +3894,14 @@ if sidebar_page == "🔑 Change Password":
     _show_change_password()
     st.stop()
 
-# ── Main three-tab layout ─────────────────────────────────────────────────────
-tab_analyze, tab_portfolio, tab_scanner = st.tabs(
-    ["📈 Analyze", "📂 My Portfolio", "🔍 Sector Scanner"]
+# ── Main four-tab layout ─────────────────────────────────────────────────────
+tab_morning, tab_analyze, tab_portfolio, tab_scanner = st.tabs(
+    ["⏰ Morning Scanner", "📈 Analyze", "📂 My Portfolio", "🔍 Sector Scanner"]
 )
+
+# ── Tab: Morning Scanner ─────────────────────────────────────────────────────
+with tab_morning:
+    show_morning_scanner()
 
 # ── Tab: Analyze ──────────────────────────────────────────────────────────────
 with tab_analyze:
