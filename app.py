@@ -3808,6 +3808,247 @@ def show_morning_scanner():
         st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
 
 
+# ── ETF Watch ────────────────────────────────────────────────────────────────
+_ETF_GROUPS = {
+    "🌍 Broad Market": {
+        "SPY":  "S&P 500",
+        "QQQ":  "Nasdaq 100",
+        "VTI":  "Total US Market",
+        "VOO":  "S&P 500 (Vanguard)",
+        "IWM":  "Russell 2000",
+        "DIA":  "Dow Jones",
+    },
+    "🏭 Sectors": {
+        "XLK":  "Technology",
+        "XLE":  "Energy",
+        "XLF":  "Financials",
+        "XLV":  "Healthcare",
+        "XLI":  "Industrials",
+        "XLY":  "Consumer Disc.",
+        "XLP":  "Consumer Staples",
+        "XLU":  "Utilities",
+        "XLRE": "Real Estate",
+    },
+    "🎯 Thematic": {
+        "GLD":  "Gold",
+        "SLV":  "Silver",
+        "TLT":  "Long-Term Bonds",
+        "VNQ":  "REITs",
+        "SOXX": "Semiconductors",
+        "ARKK": "Innovation",
+        "ICLN": "Clean Energy",
+    },
+}
+
+_ALL_ETFS = {k: v for group in _ETF_GROUPS.values() for k, v in group.items()}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _scan_etf(ticker: str) -> dict | None:
+    try:
+        df = yf.download(ticker, period="1y", interval="1d",
+                         progress=False, auto_adjust=True)
+        if df.empty or len(df) < 50:
+            return None
+
+        df    = calculate_indicators(df)
+        close = df["Close"].squeeze()
+
+        price    = float(close.iloc[-1])
+        prev     = float(close.iloc[-2])
+        day_chg  = (price - prev) / prev * 100
+
+        rsi    = float(df["RSI"].iloc[-1])   if not np.isnan(df["RSI"].iloc[-1])   else 50
+        sma20  = float(df["SMA_20"].iloc[-1]) if not np.isnan(df["SMA_20"].iloc[-1]) else price
+        sma50  = float(df["SMA_50"].iloc[-1]) if not np.isnan(df["SMA_50"].iloc[-1]) else price
+
+        # Compute SMA200 manually (not in calculate_indicators)
+        sma200_s = close.rolling(200).mean()
+        sma200   = float(sma200_s.iloc[-1]) if not np.isnan(sma200_s.iloc[-1]) else price
+
+        atr = float(df["ATR"].iloc[-1]) if not np.isnan(df["ATR"].iloc[-1]) else price * 0.01
+
+        hi52 = float(close.rolling(252).max().iloc[-1])
+        lo52 = float(close.rolling(252).min().iloc[-1])
+        pct_from_hi = (price - hi52) / hi52 * 100
+        pct_from_lo = (price - lo52) / lo52 * 100
+
+        macd_h   = float(df["MACD_Hist"].iloc[-1])
+        macd_h_p = float(df["MACD_Hist"].iloc[-2])
+
+        # Signal score
+        score = 0
+        if rsi < 35:          score += 3
+        elif rsi < 45:        score += 1
+        elif rsi > 70:        score -= 2
+        elif rsi > 60:        score -= 1
+
+        if price > sma50:     score += 1
+        else:                 score -= 1
+        if price > sma200:    score += 1
+        else:                 score -= 1
+        if macd_h > 0 and macd_h > macd_h_p: score += 2
+        elif macd_h > macd_h_p:              score += 1
+        elif macd_h < macd_h_p:              score -= 1
+
+        if score >= 4:    signal = "STRONG BUY"
+        elif score >= 2:  signal = "BUY"
+        elif score <= -4: signal = "STRONG SELL"
+        elif score <= -2: signal = "SELL"
+        else:             signal = "HOLD"
+
+        # Long-term entry flag: RSI < 45 AND price near or below SMA200
+        lt_entry = rsi < 45 and price <= sma200 * 1.02
+
+        # ATR-based levels (wider for ETFs — daily ATR)
+        entry     = round(price, 2)
+        stop_loss = round(price - 1.5 * atr, 2)
+        target1   = round(price + 2.0 * atr, 2)
+        target2   = round(price + 3.5 * atr, 2)
+        sl_pct    = (stop_loss - price) / price * 100
+        t1_pct    = (target1   - price) / price * 100
+        t2_pct    = (target2   - price) / price * 100
+        risk      = abs(price - stop_loss)
+        reward    = abs(target1 - price)
+        rr        = round(reward / risk, 1) if risk > 0 else 0
+
+        return {
+            "ticker":       ticker,
+            "name":         _ALL_ETFS.get(ticker, ticker),
+            "price":        price,
+            "day_chg":      round(day_chg, 2),
+            "rsi":          round(rsi, 1),
+            "sma20":        round(sma20, 2),
+            "sma50":        round(sma50, 2),
+            "sma200":       round(sma200, 2),
+            "hi52":         round(hi52, 2),
+            "lo52":         round(lo52, 2),
+            "pct_from_hi":  round(pct_from_hi, 2),
+            "pct_from_lo":  round(pct_from_lo, 2),
+            "signal":       signal,
+            "score":        score,
+            "lt_entry":     lt_entry,
+            "entry":        entry,
+            "stop_loss":    stop_loss,
+            "target1":      target1,
+            "target2":      target2,
+            "sl_pct":       round(sl_pct, 2),
+            "t1_pct":       round(t1_pct, 2),
+            "t2_pct":       round(t2_pct, 2),
+            "rr":           rr,
+        }
+    except Exception:
+        return None
+
+
+def show_etf_watch():
+    st.markdown("### 📊 ETF & Index Fund Watch")
+    st.caption("Long-term entry signals across major ETFs. '✅ Good Entry' = RSI < 45 and price near SMA200.")
+
+    col_r, col_ref = st.columns([5, 1])
+    with col_ref:
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🔄 Refresh", key="etf_refresh", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    # Scan all ETFs in parallel
+    all_tickers = list(_ALL_ETFS.keys())
+    with st.spinner("Loading ETF data…"):
+        results = {}
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(_scan_etf, t): t for t in all_tickers}
+            for fut in as_completed(futs):
+                r = fut.result()
+                if r:
+                    results[r["ticker"]] = r
+
+    if not results:
+        st.warning("Could not load ETF data.")
+        return
+
+    # Good entry opportunities banner
+    good_entries = [r for r in results.values() if r["lt_entry"] and "BUY" in r["signal"]]
+    if good_entries:
+        st.success(f"**{len(good_entries)} ETF(s) at potential long-term entry points:**  " +
+                   "  ".join(f"**{r['ticker']}** ({r['name']})" for r in good_entries))
+    else:
+        st.info("No ETFs currently flagged as strong long-term entry points.")
+
+    st.markdown("---")
+
+    # Render each group
+    for group_name, group_etfs in _ETF_GROUPS.items():
+        st.markdown(f"#### {group_name}")
+        tickers_in_group = [t for t in group_etfs if t in results]
+        if not tickers_in_group:
+            continue
+
+        cols_per_row = 3
+        for i in range(0, len(tickers_in_group), cols_per_row):
+            chunk = tickers_in_group[i:i + cols_per_row]
+            cols  = st.columns(cols_per_row)
+            for col, tkr in zip(cols, chunk):
+                r = results[tkr]
+                is_buy    = "BUY"  in r["signal"]
+                is_sell   = "SELL" in r["signal"]
+                sig_color = "#00c853" if is_buy else ("#d50000" if is_sell else "#aaaaaa")
+                border    = "#00c853" if r["lt_entry"] and is_buy else ("#1e1e2e" if not is_buy else "#1e1e2e")
+                lt_badge  = "✅ Good Long-Term Entry" if r["lt_entry"] and is_buy else ""
+                chg_color = "#00c853" if r["day_chg"] >= 0 else "#d50000"
+
+                col.markdown(
+                    f"""
+<div style="border:1px solid {border if border != '#1e1e2e' else '#333'};border-radius:8px;padding:10px;margin-bottom:8px">
+  <b style="font-size:1.05em">{tkr}</b>
+  <span style="color:#aaa;font-size:0.8em"> {r['name']}</span><br>
+  <b style="font-size:1.2em">${r['price']:.2f}</b>
+  <span style="color:{chg_color};font-size:0.85em"> {r['day_chg']:+.2f}%</span>
+  &nbsp;<span style="color:{sig_color};font-weight:bold;font-size:0.85em">{r['signal']}</span>
+  {"<br><span style='color:#00c853;font-size:0.8em'>" + lt_badge + "</span>" if lt_badge else ""}
+  <hr style="margin:6px 0;border-color:#333">
+  <table style="width:100%;font-size:0.82em">
+    <tr><td style="color:#aaa">RSI</td><td><b>{r['rsi']}</b></td><td style="color:#aaa">vs SMA200</td><td><b style="color:{'#00c853' if r['price']>=r['sma200'] else '#d50000'}">{((r['price']-r['sma200'])/r['sma200']*100):+.1f}%</b></td></tr>
+    <tr><td style="color:#aaa">52w Hi</td><td>{r['pct_from_hi']:+.1f}%</td><td style="color:#aaa">52w Lo</td><td>{r['pct_from_lo']:+.1f}%</td></tr>
+    <tr><td style="color:#aaa">Entry</td><td><b>${r['entry']:.2f}</b></td><td style="color:#aaa">Stop</td><td style="color:#d50000"><b>${r['stop_loss']:.2f} ({r['sl_pct']:+.1f}%)</b></td></tr>
+    <tr><td style="color:#aaa">T1</td><td><b>${r['target1']:.2f} ({r['t1_pct']:+.1f}%)</b></td><td style="color:#aaa">T2</td><td><b>${r['target2']:.2f} ({r['t2_pct']:+.1f}%)</b></td></tr>
+    <tr><td style="color:#aaa">R/R</td><td colspan="3"><b>1 : {r['rr']}</b></td></tr>
+  </table>
+</div>
+""",
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("")
+
+    # Full table
+    with st.expander("📋 Full ETF comparison table"):
+        rows = []
+        for group_name, group_etfs in _ETF_GROUPS.items():
+            for tkr in group_etfs:
+                if tkr not in results:
+                    continue
+                r = results[tkr]
+                rows.append({
+                    "Group":      group_name,
+                    "Ticker":     tkr,
+                    "Name":       r["name"],
+                    "Price":      f"${r['price']:.2f}",
+                    "Day %":      f"{r['day_chg']:+.2f}%",
+                    "Signal":     r["signal"],
+                    "RSI":        r["rsi"],
+                    "vs SMA200":  f"{((r['price']-r['sma200'])/r['sma200']*100):+.1f}%",
+                    "52w Hi":     f"{r['pct_from_hi']:+.1f}%",
+                    "Entry":      f"${r['entry']:.2f}",
+                    "T1":         f"${r['target1']:.2f}",
+                    "T2":         f"${r['target2']:.2f}",
+                    "Stop":       f"${r['stop_loss']:.2f}",
+                    "R/R":        f"1:{r['rr']}",
+                    "LT Entry?":  "✅ Yes" if r["lt_entry"] else "—",
+                })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 st.sidebar.header("Settings")
 
@@ -3894,14 +4135,18 @@ if sidebar_page == "🔑 Change Password":
     _show_change_password()
     st.stop()
 
-# ── Main four-tab layout ─────────────────────────────────────────────────────
-tab_morning, tab_analyze, tab_portfolio, tab_scanner = st.tabs(
-    ["⏰ Morning Scanner", "📈 Analyze", "📂 My Portfolio", "🔍 Sector Scanner"]
+# ── Main five-tab layout ─────────────────────────────────────────────────────
+tab_morning, tab_etf, tab_analyze, tab_portfolio, tab_scanner = st.tabs(
+    ["⏰ Morning Scanner", "📊 ETF Watch", "📈 Analyze", "📂 My Portfolio", "🔍 Sector Scanner"]
 )
 
 # ── Tab: Morning Scanner ─────────────────────────────────────────────────────
 with tab_morning:
     show_morning_scanner()
+
+# ── Tab: ETF Watch ────────────────────────────────────────────────────────────
+with tab_etf:
+    show_etf_watch()
 
 # ── Tab: Analyze ──────────────────────────────────────────────────────────────
 with tab_analyze:
