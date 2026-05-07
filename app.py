@@ -3590,10 +3590,11 @@ _MORNING_WATCHLIST = [
 @st.cache_data(ttl=120, show_spinner=False)
 def _scan_morning_pick(ticker: str) -> dict | None:
     try:
-        df = yf.download(ticker, period="5d", interval="5m",
-                         progress=False, auto_adjust=True)
+        df = yf.Ticker(ticker).history(period="5d", interval="5m", auto_adjust=True)
         if df.empty or len(df) < 40:
             return None
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
         close  = df["Close"].squeeze()
         volume = df["Volume"].squeeze()
@@ -3846,10 +3847,13 @@ _ALL_ETFS = {k: v for group in _ETF_GROUPS.values() for k, v in group.items()}
 @st.cache_data(ttl=300, show_spinner=False)
 def _scan_etf(ticker: str) -> dict | None:
     try:
-        df = yf.download(ticker, period="1y", interval="1d",
-                         progress=False, auto_adjust=True)
+        df = yf.Ticker(ticker).history(period="1y", interval="1d", auto_adjust=True)
         if df.empty or len(df) < 50:
             return None
+
+        # Ensure flat column names (drop MultiIndex if present)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
 
         df    = calculate_indicators(df)
         close = df["Close"].squeeze()
