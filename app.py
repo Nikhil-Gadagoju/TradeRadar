@@ -2824,6 +2824,99 @@ def score_option_row(row, current_price: float, is_call: bool) -> float:
     return score
 
 
+def _options_intelligence(stock: "yf.Ticker", current_price: float) -> dict:
+    """
+    Reads the nearest-expiry options chain and returns:
+      pcr_vol, pcr_oi, max_pain, unusual_calls, unusual_puts, sentiment
+    Returns empty dict on any failure.
+    """
+    try:
+        expirations = stock.options
+        if not expirations:
+            return {}
+
+        # Use the nearest expiry with decent liquidity (first 2 expiries)
+        chain = None
+        for exp in expirations[:2]:
+            try:
+                c = stock.option_chain(exp)
+                if not c.calls.empty and not c.puts.empty:
+                    chain = c
+                    chain_exp = exp
+                    break
+            except Exception:
+                continue
+        if chain is None:
+            return {}
+
+        calls = chain.calls.copy()
+        puts  = chain.puts.copy()
+
+        # Fill NaN volumes/OI with 0
+        for col in ["volume", "openInterest"]:
+            calls[col] = pd.to_numeric(calls[col], errors="coerce").fillna(0)
+            puts[col]  = pd.to_numeric(puts[col],  errors="coerce").fillna(0)
+
+        total_call_vol = calls["volume"].sum()
+        total_put_vol  = puts["volume"].sum()
+        total_call_oi  = calls["openInterest"].sum()
+        total_put_oi   = puts["openInterest"].sum()
+
+        pcr_vol = round(total_put_vol  / total_call_vol,  2) if total_call_vol  > 0 else 1.0
+        pcr_oi  = round(total_put_oi   / total_call_oi,   2) if total_call_oi   > 0 else 1.0
+
+        # Max pain: strike where total option value at expiry is minimized
+        all_strikes = sorted(set(calls["strike"]).union(set(puts["strike"])))
+        min_pain = float("inf")
+        max_pain_strike = current_price
+        for test_price in all_strikes:
+            call_pain = ((test_price - calls["strike"]).clip(lower=0) * calls["openInterest"]).sum()
+            put_pain  = ((puts["strike"]  - test_price).clip(lower=0) * puts["openInterest"]).sum()
+            total_pain = call_pain + put_pain
+            if total_pain < min_pain:
+                min_pain = total_pain
+                max_pain_strike = test_price
+
+        # Unusual activity: volume > 2× OI (new money, not just rolling)
+        calls["vol_oi_ratio"] = calls.apply(
+            lambda r: r["volume"] / r["openInterest"] if r["openInterest"] > 100 else 0, axis=1)
+        puts["vol_oi_ratio"]  = puts.apply(
+            lambda r: r["volume"] / r["openInterest"] if r["openInterest"] > 100 else 0, axis=1)
+
+        unusual_calls = calls[calls["vol_oi_ratio"] > 2].nlargest(3, "volume")[
+            ["strike", "volume", "openInterest", "lastPrice", "impliedVolatility"]
+        ].to_dict("records")
+        unusual_puts = puts[puts["vol_oi_ratio"] > 2].nlargest(3, "volume")[
+            ["strike", "volume", "openInterest", "lastPrice", "impliedVolatility"]
+        ].to_dict("records")
+
+        # Sentiment from PCR + max pain
+        if pcr_vol < 0.6 and max_pain_strike >= current_price:
+            sentiment = "BULLISH"
+        elif pcr_vol > 1.2 and max_pain_strike <= current_price:
+            sentiment = "BEARISH"
+        elif pcr_vol < 0.8:
+            sentiment = "LEANING BULLISH"
+        elif pcr_vol > 1.0:
+            sentiment = "LEANING BEARISH"
+        else:
+            sentiment = "NEUTRAL"
+
+        return {
+            "exp":           chain_exp,
+            "pcr_vol":       pcr_vol,
+            "pcr_oi":        pcr_oi,
+            "total_call_vol": int(total_call_vol),
+            "total_put_vol":  int(total_put_vol),
+            "max_pain":      round(max_pain_strike, 2),
+            "unusual_calls": unusual_calls,
+            "unusual_puts":  unusual_puts,
+            "sentiment":     sentiment,
+        }
+    except Exception:
+        return {}
+
+
 def show_options(ticker: str, current_price: float, hist: pd.DataFrame, overall_signal: str):
     from datetime import datetime, date
 
@@ -2831,10 +2924,113 @@ def show_options(ticker: str, current_price: float, hist: pd.DataFrame, overall_
     latest = hist.iloc[-1]
     atr    = float(hist["ATR"].iloc[-1]) if "ATR" in hist.columns else float((hist["High"] - hist["Low"]).rolling(14).mean().iloc[-1])
 
+    # ── Options Intelligence Panel ────────────────────────────────────────────
+    st.markdown("## 📡 Options Intelligence")
+    with st.spinner("Reading options flow…"):
+        intel = _options_intelligence(stock, current_price)
+
+    if intel:
+        sent = intel["sentiment"]
+        sent_color = {"BULLISH": "#00c853", "LEANING BULLISH": "#69f0ae",
+                      "NEUTRAL": "#aaaaaa", "LEANING BEARISH": "#ff7043",
+                      "BEARISH": "#d50000"}.get(sent, "#aaaaaa")
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Put/Call Ratio (Volume)", intel["pcr_vol"],
+                  help="< 0.7 = bullish  |  > 1.2 = bearish  |  ~1.0 = neutral")
+        c2.metric("Put/Call Ratio (OI)",    intel["pcr_oi"],
+                  help="Open Interest ratio — reflects positioning, not just today's trades")
+        c3.metric("Max Pain",  f"${intel['max_pain']:.2f}",
+                  help="Strike price where most options expire worthless — market makers tend to pin price here at expiry")
+        mp_dist = intel["max_pain"] - current_price
+        c4.metric("Max Pain vs Price", f"{mp_dist:+.2f}",
+                  help="Positive = max pain is above current price (bullish pull), Negative = below (bearish pull)")
+
+        st.markdown(
+            f"**Options Sentiment:** <span style='color:{sent_color};font-size:1.1em;font-weight:bold'>{sent}</span>  "
+            f"<span style='color:#aaa;font-size:0.85em'>(expiry: {intel['exp']})</span>",
+            unsafe_allow_html=True,
+        )
+
+        # PCR interpretation
+        pcr = intel["pcr_vol"]
+        if pcr < 0.6:
+            st.success(f"PCR {pcr} — Heavy call buying. Market is pricing in an **upward move**.")
+        elif pcr > 1.3:
+            st.error(f"PCR {pcr} — Heavy put buying. Market is pricing in a **downward move**.")
+        elif pcr > 1.0:
+            st.warning(f"PCR {pcr} — Slightly more puts than calls. Mild bearish lean.")
+        else:
+            st.info(f"PCR {pcr} — Balanced flow. No strong directional bias from options.")
+
+        # Max pain interpretation
+        if mp_dist > current_price * 0.01:
+            st.success(f"Max pain ${intel['max_pain']:.2f} is **above** current price — gravitational pull toward higher prices by expiry.")
+        elif mp_dist < -current_price * 0.01:
+            st.warning(f"Max pain ${intel['max_pain']:.2f} is **below** current price — gravitational pull toward lower prices by expiry.")
+
+        # Unusual activity
+        if intel["unusual_calls"] or intel["unusual_puts"]:
+            st.markdown("#### 🔥 Unusual Options Activity")
+            ua_cols = st.columns(2)
+            with ua_cols[0]:
+                if intel["unusual_calls"]:
+                    st.markdown("**Unusual CALL volume** (new bullish bets)")
+                    for r in intel["unusual_calls"]:
+                        iv_pct = r.get("impliedVolatility", 0) * 100
+                        st.markdown(
+                            f"- **${r['strike']:.0f} Call** — {int(r['volume']):,} vol / "
+                            f"{int(r['openInterest']):,} OI &nbsp;·&nbsp; IV {iv_pct:.0f}%  "
+                            f"@ ${r['lastPrice']:.2f}"
+                        )
+            with ua_cols[1]:
+                if intel["unusual_puts"]:
+                    st.markdown("**Unusual PUT volume** (new bearish bets)")
+                    for r in intel["unusual_puts"]:
+                        iv_pct = r.get("impliedVolatility", 0) * 100
+                        st.markdown(
+                            f"- **${r['strike']:.0f} Put** — {int(r['volume']):,} vol / "
+                            f"{int(r['openInterest']):,} OI &nbsp;·&nbsp; IV {iv_pct:.0f}%  "
+                            f"@ ${r['lastPrice']:.2f}"
+                        )
+
+        # Combined signal: technicals + options
+        st.markdown("---")
+        st.markdown("#### 🤝 Combined Signal (Technicals + Options Flow)")
+        tech_bull = overall_signal in ("STRONG BUY", "BUY")
+        tech_bear = overall_signal in ("STRONG SELL", "SELL")
+        opt_bull  = "BULLISH" in sent
+        opt_bear  = "BEARISH" in sent
+
+        if tech_bull and opt_bull:
+            st.success(f"**STRONG LONG** — Both technicals ({overall_signal}) and options flow ({sent}) agree: price likely going UP.")
+            combined_direction = "BUY"
+        elif tech_bear and opt_bear:
+            st.error(f"**STRONG SHORT** — Both technicals ({overall_signal}) and options flow ({sent}) agree: price likely going DOWN.")
+            combined_direction = "SELL"
+        elif tech_bull and opt_bear:
+            st.warning(f"**CONFLICT** — Technicals say {overall_signal} but options flow says {sent}. Reduce size or wait for confirmation.")
+            combined_direction = "HOLD"
+        elif tech_bear and opt_bull:
+            st.warning(f"**CONFLICT** — Technicals say {overall_signal} but options flow says {sent}. Reduce size or wait for confirmation.")
+            combined_direction = "HOLD"
+        elif tech_bull:
+            st.info(f"Technicals bullish ({overall_signal}), options neutral — proceed with normal size.")
+            combined_direction = "BUY"
+        elif tech_bear:
+            st.info(f"Technicals bearish ({overall_signal}), options neutral — proceed with normal size.")
+            combined_direction = "SELL"
+        else:
+            st.info("No strong signal from either technicals or options flow.")
+            combined_direction = "HOLD"
+    else:
+        combined_direction = overall_signal if overall_signal in ("BUY","STRONG BUY","SELL","STRONG SELL") else "HOLD"
+
+    st.markdown("---")
     st.markdown("## 🧭 Step 1 — Should you buy a Call or Put?")
 
-    bullish = overall_signal in ("STRONG BUY", "BUY")
-    bearish = overall_signal in ("STRONG SELL", "SELL")
+    bullish = combined_direction in ("BUY", "STRONG BUY")
+    bearish = combined_direction in ("SELL", "STRONG SELL")
 
     if bullish:
         st.success(f"""
